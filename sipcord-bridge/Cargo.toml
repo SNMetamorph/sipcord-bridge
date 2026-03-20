@@ -1,0 +1,113 @@
+[package]
+name = "sipcord-bridge"
+version = "1.5.5"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sipcord-bridge"
+path = "src/main.rs"
+
+[lib]
+name = "sipcord_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = "0.7"
+
+# Discord
+serenity = { git = "https://github.com/serenity-rs/serenity", default-features = false, features = [
+    "default_no_backend",
+    "rustls_backend",
+    "voice",
+    "model",
+    "framework",
+] , branch = "next"}
+songbird = { version = "0.5.0", git = "https://github.com/jtscuba/songbird", features = ["driver", "gateway", "receive", "tungstenite"] , branch = "davey" }
+poise = { version = "0.6.1", git = "https://github.com/serenity-rs/poise", branch = "serenity-next"}
+
+# HTTP client for API calls
+reqwest = { version = "0.13.1", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls",
+] }
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# Audio processing
+audiopus = "0.3.0-rc.0"
+rubato = "1.0.1"
+audioadapter = "2.0.0"
+audioadapter-buffers = "2.0.0"
+
+# Symphonia with PCM codec for RawAdapter support in Songbird
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "pcm",
+    "flac",
+] }
+
+# FLAC decoder
+claxon = "0.4.3"
+
+# SIP - using pjsua bindings (builds pjproject from pjsua/pjproject submodule)
+pjsua = { path = "../pjsua" }
+
+# SpanDSP - fax demodulation
+spandsp = "0.1.5"
+
+# UDPTL transport for T.38 fax
+udptl = "0.1.0"
+
+# Image conversion (fax TIFF -> PNG for Discord)
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
+
+# Networking
+ipnet = "2.11.0"
+
+# Lock-free ring buffer for real-time audio
+rtrb = "0.3.2"
+
+# Async trait for dyn Backend
+async-trait = "0.1"
+
+# Utilities
+anyhow = "1.0.100"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+parking_lot = "0.12.5"
+crossbeam-channel = "0.5.15"
+bytes = "1.11.1"
+byteorder = "1.5.0"
+symphonia-core = "0.5.5"
+dashmap = "6.1.0"
+moka = { version = "0.12.13", features = ["sync"] }
+
+# Crypto (MD5 for SIP digest auth cache verification, rand for nonces)
+md-5 = "0.10"
+rand = "0.9"
+
+# Configuration
+dotenvy = "0.15.7"
+envy = "0.4"
+base64 = "0.22.1"
+toml = "0.9.11"
+
+# Date/time handling
+chrono = { version = "0.4.43", features = ["serde"] }
+
+# TLS - explicit crypto provider for rustls 0.23+
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+crossbeam-queue = "0.3.12"

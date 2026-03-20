@@ -1,0 +1,12 @@
+[package]
+name = "pjsua"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for pjsua (pjproject SIP library)"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"
+cmake = "0.1"

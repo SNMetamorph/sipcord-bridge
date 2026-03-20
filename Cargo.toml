@@ -1,0 +1,3 @@
+[workspace]
+members = ["sipcord-bridge", "pjsua"]
+resolver = "2"

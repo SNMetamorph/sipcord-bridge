@@ -1,0 +1,273 @@
+//! Streaming audio player for large files
+//!
+//! Provides a file-backed streaming player that reads audio from disk
+//! on-demand rather than loading the entire file into memory.
+//!
+//! Uses Symphonia for FLAC decoding (pure Rust).
+
+use crate::transport::sip::CONF_SAMPLE_RATE;
+use anyhow::{Context, Result};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::path::Path;
+use symphonia::core::audio::{AudioBufferRef, Signal};
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+
+/// Streaming player for large audio files
+///
+/// Reads FLAC frames on-demand to avoid loading entire file into memory.
+pub struct StreamingPlayer {
+    /// Symphonia format reader
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    /// Symphonia decoder
+    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    /// Track ID we're decoding
+    track_id: u32,
+    /// Buffer of decoded samples ready for playback
+    samples_buffer: VecDeque<i16>,
+    /// Whether we've reached end of file
+    eof: bool,
+    /// Total samples read from file (for debugging)
+    total_samples_read: u64,
+    /// Total samples delivered via get_frame (for debugging)
+    total_samples_delivered: u64,
+}
+
+impl StreamingPlayer {
+    /// Create a new streaming player for a FLAC file
+    pub fn new(path: &Path) -> Result<Self> {
+        let file = File::open(path)
+            .with_context(|| format!("Failed to open streaming file: {}", path.display()))?;
+
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
+
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .with_context(|| format!("Failed to probe format: {}", path.display()))?;
+
+        let format = probed.format;
+
+        // Find the first audio track
+        let track = format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+            .ok_or_else(|| anyhow::anyhow!("No audio track found in {}", path.display()))?;
+
+        let track_id = track.id;
+
+        // Verify sample rate
+        let sample_rate = track
+            .codec_params
+            .sample_rate
+            .ok_or_else(|| anyhow::anyhow!("No sample rate in track"))?;
+
+        if sample_rate != CONF_SAMPLE_RATE {
+            anyhow::bail!(
+                "Streaming file {} has wrong sample rate: {} Hz (expected {} Hz)",
+                path.display(),
+                sample_rate,
+                CONF_SAMPLE_RATE
+            );
+        }
+
+        let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
+
+        let n_frames = track.codec_params.n_frames;
+
+        tracing::info!(
+            "Created Symphonia streaming player for {}: {}Hz, {} channels, n_frames={:?}",
+            path.display(),
+            sample_rate,
+            channels,
+            n_frames
+        );
+
+        let decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .with_context(|| "Failed to create decoder")?;
+
+        Ok(Self {
+            format,
+            decoder,
+            track_id,
+            samples_buffer: VecDeque::with_capacity(4096),
+            eof: false,
+            total_samples_read: 0,
+            total_samples_delivered: 0,
+        })
+    }
+
+    /// Get the next frame of samples (320 samples for 20ms at 16kHz)
+    ///
+    /// Returns None when the file is finished.
+    pub fn get_frame(&mut self, frame_size: usize) -> Option<Vec<i16>> {
+        // Fill buffer if needed
+        while self.samples_buffer.len() < frame_size && !self.eof {
+            if !self.read_more_samples() {
+                self.eof = true;
+            }
+        }
+
+        // Return None if no samples available
+        if self.samples_buffer.is_empty() {
+            return None;
+        }
+
+        // Drain requested samples (or all remaining)
+        let count = frame_size.min(self.samples_buffer.len());
+        let samples: Vec<i16> = self.samples_buffer.drain(..count).collect();
+        self.total_samples_delivered += samples.len() as u64;
+
+        // Pad with silence if we got fewer than requested
+        if samples.len() < frame_size {
+            let mut padded = samples;
+            padded.resize(frame_size, 0);
+            return Some(padded);
+        }
+
+        Some(samples)
+    }
+
+    /// Check if playback is complete
+    pub fn is_finished(&self) -> bool {
+        let finished = self.eof && self.samples_buffer.is_empty();
+        if finished {
+            tracing::info!(
+                "StreamingPlayer finished: read {} samples, delivered {} samples",
+                self.total_samples_read,
+                self.total_samples_delivered,
+            );
+        }
+        finished
+    }
+
+    /// Read more samples from the file into the buffer
+    /// Returns false when EOF is reached
+    fn read_more_samples(&mut self) -> bool {
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(packet) => packet,
+                Err(symphonia::core::errors::Error::IoError(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return false;
+                }
+                Err(e) => {
+                    tracing::debug!("Error reading packet: {}", e);
+                    return false;
+                }
+            };
+
+            // Skip packets from other tracks
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    // Convert to i16 samples
+                    let samples_added = convert_audio_buffer(&decoded, &mut self.samples_buffer);
+                    self.total_samples_read += samples_added as u64;
+                    return true;
+                }
+                Err(symphonia::core::errors::Error::DecodeError(e)) => {
+                    tracing::debug!("Decode error: {}", e);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("Fatal decode error: {}", e);
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Convert Symphonia audio buffer to i16 samples and add to buffer
+fn convert_audio_buffer(audio: &AudioBufferRef, samples_buffer: &mut VecDeque<i16>) -> usize {
+    let mut count = 0;
+
+    match audio {
+        AudioBufferRef::S16(buf) => {
+            let channels = buf.spec().channels.count();
+            let frames = buf.frames();
+
+            for frame_idx in 0..frames {
+                if channels == 1 {
+                    let sample = buf.chan(0)[frame_idx];
+                    samples_buffer.push_back(sample);
+                    count += 1;
+                } else {
+                    // Stereo to mono: average channels
+                    let mut sum: i32 = 0;
+                    for ch in 0..channels {
+                        sum += buf.chan(ch)[frame_idx] as i32;
+                    }
+                    let mono = (sum / channels as i32) as i16;
+                    samples_buffer.push_back(mono);
+                    count += 1;
+                }
+            }
+        }
+        AudioBufferRef::S32(buf) => {
+            let channels = buf.spec().channels.count();
+            let frames = buf.frames();
+
+            for frame_idx in 0..frames {
+                if channels == 1 {
+                    let sample = (buf.chan(0)[frame_idx] >> 16) as i16;
+                    samples_buffer.push_back(sample);
+                    count += 1;
+                } else {
+                    let mut sum: i64 = 0;
+                    for ch in 0..channels {
+                        sum += buf.chan(ch)[frame_idx] as i64;
+                    }
+                    let mono = ((sum / channels as i64) >> 16) as i16;
+                    samples_buffer.push_back(mono);
+                    count += 1;
+                }
+            }
+        }
+        AudioBufferRef::F32(buf) => {
+            let channels = buf.spec().channels.count();
+            let frames = buf.frames();
+
+            for frame_idx in 0..frames {
+                if channels == 1 {
+                    let sample = (buf.chan(0)[frame_idx] * 32767.0) as i16;
+                    samples_buffer.push_back(sample);
+                    count += 1;
+                } else {
+                    let mut sum: f32 = 0.0;
+                    for ch in 0..channels {
+                        sum += buf.chan(ch)[frame_idx];
+                    }
+                    let mono = ((sum / channels as f32) * 32767.0) as i16;
+                    samples_buffer.push_back(mono);
+                    count += 1;
+                }
+            }
+        }
+        _ => {
+            tracing::warn!("Unsupported audio buffer format");
+        }
+    }
+
+    count
+}

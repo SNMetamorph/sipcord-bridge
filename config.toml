@@ -1,0 +1,43 @@
+# Sipcord Bridge — sample configuration
+#
+# Copy this file to your working directory and adjust as needed.
+# All sections except [sounds] are optional (defaults shown).
+
+[sounds]
+# System sounds (preloaded into memory at startup)
+discord_join = { src = "discord_join.wav", preload = true }
+connecting = { src = "connecting.wav", preload = true }
+unknown_error = { src = "unknown.wav", preload = true }
+no_channel_mapping = { src = "no_channel_mapping.wav", preload = true }
+no_permissions = { src = "no_permissions.wav", preload = true }
+server_is_busy = { src = "serverisbusy.wav", preload = true }
+
+# Easter eggs (streamed from disk on demand)
+easteregg = { src = "nokia.flac", preload = false, extension = 11111 }
+hold = { src = "JoonaKouvolalainen.flac", preload = false, extension = 10000 }
+
+# Test tone — 440Hz sine wave, generated dynamically (no file needed)
+test_tone = { extension = 0 }
+
+[bridge]
+# rtp_inactivity_timeout_secs = 60
+# no_audio_timeout_secs = 10
+# empty_bridge_grace_period_secs = 30
+# max_channel_buffer_samples = 32000
+# api_timeout_secs = 10
+# health_check_interval_secs = 5
+# voice_join_max_retries = 2
+# voice_join_retry_delay_secs = 5
+# pjsip_log_level = 4
+
+[audio]
+# ring_buffer_samples = 96000
+# pre_buffer_samples = 14400
+# vad_silence_threshold = 200
+# vad_mute_threshold = 50
+# vad_silence_frames_before_stop = 15
+
+[fax]
+# tmp_folder = "/tmp/sipcord-fax"
+# prefix = "fax_"
+# output_format = "png"
