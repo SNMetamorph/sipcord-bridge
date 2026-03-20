@@ -22,9 +22,9 @@ use songbird::{
     Config, CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler, Songbird, TrackEvent,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
@@ -360,7 +360,9 @@ pub fn send_audio_to_discord_direct(
                     if count.is_multiple_of(50) {
                         debug!(
                             "Resampler: input={} samples, output={} samples (ratio={:.2}, expected=3.0)",
-                            input_len, output_mono_len, output_mono_len as f64 / input_len as f64
+                            input_len,
+                            output_mono_len,
+                            output_mono_len as f64 / input_len as f64
                         );
                         debug!(
                             "SIP→Discord #{}: mono_out={}, stereo_out={} samples ({} bytes as f32)",
@@ -446,7 +448,7 @@ fn silence_threshold() -> i16 {
     *CACHED.get_or_init(|| crate::config::AppConfig::audio().vad_silence_threshold)
 }
 
-pub use voice::{resample_audio, resample_audio_into, StreamingAudioSource, DISCORD_SAMPLE_RATE};
+pub use voice::{DISCORD_SAMPLE_RATE, StreamingAudioSource, resample_audio, resample_audio_into};
 
 /// Events emitted by the Discord module
 #[derive(Debug, Clone)]
@@ -506,19 +508,20 @@ impl SharedDiscordClient {
         });
 
         // Wait for gateway Ready event to get the bot's user ID
-        let bot_user_id =
-            match tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx).await {
-                Ok(Ok(id)) => {
-                    info!("Shared Discord client ready, bot user ID: {}", id);
-                    id
-                }
-                _ => {
-                    error!(
+        let bot_user_id = match tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx)
+            .await
+        {
+            Ok(Ok(id)) => {
+                info!("Shared Discord client ready, bot user ID: {}", id);
+                id
+            }
+            _ => {
+                error!(
                     "Failed to get bot user ID from shared client, feedback filtering may not work"
                 );
-                    0
-                }
-            };
+                0
+            }
+        };
 
         // Let gateway stabilize
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -907,16 +910,13 @@ impl VoiceEventHandler for TrackEventHandler {
                         // Normal state changes - log at trace level
                         trace!(
                             "Track event for bridge {}: mode={:?}, position={:?}",
-                            self.bridge_id,
-                            state.playing,
-                            state.position,
+                            self.bridge_id, state.playing, state.position,
                         );
                     }
                     _ => {
                         trace!(
                             "Track event for bridge {}: mode={:?}",
-                            self.bridge_id,
-                            state.playing,
+                            self.bridge_id, state.playing,
                         );
                     }
                 }
@@ -1021,9 +1021,7 @@ impl VoiceEventHandler for VoiceReceiver {
                     } else {
                         trace!(
                             "Recorded SSRC {} -> user {} for bridge {}",
-                            speaking.ssrc,
-                            user_id_snowflake,
-                            self.bridge_id
+                            speaking.ssrc, user_id_snowflake, self.bridge_id
                         );
                     }
                 }
@@ -1102,9 +1100,7 @@ impl VoiceEventHandler for VoiceReceiver {
                 if should_log {
                     trace!(
                         "VoiceTick #{}: {} speaking, {} silent users",
-                        count,
-                        speaker_count,
-                        silent_count
+                        count, speaker_count, silent_count
                     );
                 }
 
@@ -1237,9 +1233,7 @@ impl VoiceEventHandler for VoiceReceiver {
                     } else if mono_len > 0 {
                         trace!(
                             "VoiceTick: {} speakers, {} mono samples, max amp: {}",
-                            speaker_count,
-                            mono_len,
-                            max_amp
+                            speaker_count, mono_len, max_amp
                         );
 
                         // Direct ring buffer path: resample 48kHz→16kHz and write to ring buffer

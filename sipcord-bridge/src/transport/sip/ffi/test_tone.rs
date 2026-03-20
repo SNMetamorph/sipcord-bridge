@@ -128,7 +128,7 @@ pub unsafe extern "C" fn test_tone_on_destroy(this_port: *mut pjmedia_port) -> p
 ///
 /// The tone plays indefinitely until the caller hangs up. No automatic hangup.
 pub fn start_test_tone_to_call(call_id: CallId) -> Result<()> {
-    use super::frame_utils::{create_and_connect_port, PortCallbacks};
+    use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
     // Get call's conference port
     let call_conf_port = CALL_CONF_PORTS

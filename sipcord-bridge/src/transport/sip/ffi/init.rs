@@ -251,7 +251,7 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         // won't accept TCP connections. We must respect the transport the
         // client registered with.
         {
-            extern "C" {
+            unsafe extern "C" {
                 static mut pjsip_sip_cfg_var: pjsip_cfg_t;
             }
             pjsip_sip_cfg_var.endpt.disable_tcp_switch = pj_constants__PJ_TRUE as _;
@@ -538,14 +538,19 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
 
         tracing::info!(
             "Master port ACTUAL config: clock_rate={}, channels={}, frame_time={}us, bits={}, samples_per_frame={}",
-            actual_clock_rate, actual_channel_count, actual_frame_time_usec, actual_bits_per_sample, actual_samples_per_frame
+            actual_clock_rate,
+            actual_channel_count,
+            actual_frame_time_usec,
+            actual_bits_per_sample,
+            actual_samples_per_frame
         );
 
         // CRITICAL: Verify the conference bridge is actually at our configured rate
         if actual_clock_rate != CONF_SAMPLE_RATE {
             tracing::error!(
                 "SAMPLE RATE MISMATCH! Requested {}Hz but got {}Hz - audio will play at wrong speed!",
-                CONF_SAMPLE_RATE, actual_clock_rate
+                CONF_SAMPLE_RATE,
+                actual_clock_rate
             );
         }
 

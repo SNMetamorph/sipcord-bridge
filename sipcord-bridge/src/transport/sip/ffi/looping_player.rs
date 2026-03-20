@@ -8,8 +8,8 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global state for looping players: call_id -> LoopingPlayerState
 pub static LOOPING_PLAYERS: OnceLock<Mutex<HashMap<CallId, LoopingPlayerState>>> = OnceLock::new();
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn looping_player_on_destroy(this_port: *mut pjmedia_port)
 /// Creates a pjmedia_port that loops the given samples and connects it to the call.
 /// The loop continues until stop_loop is called.
 pub fn start_loop(call_id: CallId, samples: Vec<i16>) -> Result<()> {
-    use super::frame_utils::{create_and_connect_port, PortCallbacks};
+    use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
     // Check if already looping for this call
     {

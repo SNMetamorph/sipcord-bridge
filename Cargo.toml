@@ -1,3 +1,9 @@
 [workspace]
 members = ["sipcord-bridge", "pjsua"]
 resolver = "2"
+
+[workspace.package]
+authors = ["coral <jonas@jonasbengtson.se>"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/coral/sipcord-bridge"
+homepage = "https://sipcord.net/"

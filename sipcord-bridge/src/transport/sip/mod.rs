@@ -15,17 +15,17 @@ pub use audio_thread::{
     check_rtp_inactivity, cleanup_zombie_pjsua_calls, set_timeout_event_sender,
     validate_counted_calls,
 };
-pub use callbacks::{set_outbound_event_sender, T38_PRESOCKETS};
+pub use callbacks::{T38_PRESOCKETS, set_outbound_event_sender};
 pub use channel_audio::{
     cleanup_channel_port, clear_channel_stale_audio, register_call_channel,
     register_discord_to_sip, unregister_call_channel, unregister_discord_to_sip,
 };
-pub use register_handler::{set_register_event_sender, set_sip_command_sender, PendingRegisterTsx};
+pub use register_handler::{PendingRegisterTsx, set_register_event_sender, set_sip_command_sender};
 
 use crate::config::{SipConfig, TlsConfig};
 use crate::transport::discord::send_audio_to_discord_direct;
 use anyhow::Result;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::net::IpAddr;
@@ -303,8 +303,7 @@ fn run_pjsua_loop(
                     // No sender registered for this channel - bridge might not be ready yet
                     trace!(
                         "No Discord sender for channel {} (direct audio dropped, count={})",
-                        channel_id,
-                        count
+                        channel_id, count
                     );
                 }
             }

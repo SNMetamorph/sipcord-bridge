@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 // CallId newtype
@@ -390,7 +390,6 @@ pub fn queue_pjsua_op(op: PendingPjsuaOp) {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_call_id_invalid() {
         assert_eq!(CallId::INVALID.get(), -1);
@@ -425,7 +424,6 @@ mod tests {
         assert_eq!(format!("{:?}", id), "CallId(3)");
     }
 
-
     #[test]
     fn test_conf_port_invalid() {
         assert_eq!(ConfPort::INVALID.get(), -1);
@@ -459,7 +457,6 @@ mod tests {
         assert_eq!(format!("{}", port), "4");
         assert_eq!(format!("{:?}", port), "ConfPort(4)");
     }
-
 
     #[test]
     fn test_digest_auth_params_default() {

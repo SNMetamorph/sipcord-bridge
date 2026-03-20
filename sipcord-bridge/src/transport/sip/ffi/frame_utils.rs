@@ -4,8 +4,8 @@
 //! put_frame callback used by ports that only produce audio.
 
 use super::types::{
-    CallId, ConfPort, SendablePool, CONF_CHANNELS, CONF_MASTER_PORT, CONF_SAMPLE_RATE,
-    SAMPLES_PER_FRAME,
+    CONF_CHANNELS, CONF_MASTER_PORT, CONF_SAMPLE_RATE, CallId, ConfPort, SAMPLES_PER_FRAME,
+    SendablePool,
 };
 use anyhow::Result;
 use parking_lot::Mutex;

@@ -12,7 +12,7 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use sipcord_bridge::call::BridgeCoordinator;
-use sipcord_bridge::config::{AppConfig, EnvConfig, SipConfig, APP_CONFIG};
+use sipcord_bridge::config::{APP_CONFIG, AppConfig, EnvConfig, SipConfig};
 use sipcord_bridge::routing::static_router::StaticBackend;
 use sipcord_bridge::transport::discord::SharedDiscordClient;
 use sipcord_bridge::transport::sip::SipTransport;

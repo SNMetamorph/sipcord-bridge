@@ -160,7 +160,9 @@ impl SoundManager {
             if rate != CONF_SAMPLE_RATE {
                 anyhow::bail!(
                     "Sound '{}' has wrong sample rate: {} Hz (expected {} Hz). Pre-resample the file.",
-                    name, rate, CONF_SAMPLE_RATE
+                    name,
+                    rate,
+                    CONF_SAMPLE_RATE
                 );
             }
             return Ok(samples);
@@ -174,7 +176,9 @@ impl SoundManager {
             if rate != CONF_SAMPLE_RATE {
                 anyhow::bail!(
                     "Sound '{}' has wrong sample rate: {} Hz (expected {} Hz). Pre-resample the file.",
-                    name, rate, CONF_SAMPLE_RATE
+                    name,
+                    rate,
+                    CONF_SAMPLE_RATE
                 );
             }
             return Ok(samples);

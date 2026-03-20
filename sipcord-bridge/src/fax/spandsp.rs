@@ -89,8 +89,12 @@ fn configure_t30(
     t30.set_supported_compressions(compressions)
         .map_err(|e| anyhow::anyhow!("Failed to set compressions: {}", e))?;
 
-    let sizes = T4_SUPPORT_WIDTH_215MM | T4_SUPPORT_WIDTH_255MM | T4_SUPPORT_WIDTH_303MM
-        | T4_RESOLUTION_R8_STANDARD | T4_RESOLUTION_R8_FINE | T4_RESOLUTION_R8_SUPERFINE
+    let sizes = T4_SUPPORT_WIDTH_215MM
+        | T4_SUPPORT_WIDTH_255MM
+        | T4_SUPPORT_WIDTH_303MM
+        | T4_RESOLUTION_R8_STANDARD
+        | T4_RESOLUTION_R8_FINE
+        | T4_RESOLUTION_R8_SUPERFINE
         | T4_RESOLUTION_200_200;
     t30.set_supported_image_sizes(sizes)
         .map_err(|e| anyhow::anyhow!("Failed to set image sizes: {}", e))?;

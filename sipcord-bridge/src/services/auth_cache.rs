@@ -166,7 +166,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-
     #[test]
     fn test_md5_hex_empty() {
         assert_eq!(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e");
@@ -176,7 +175,6 @@ mod tests {
     fn test_md5_hex_hello() {
         assert_eq!(md5_hex("hello"), "5d41402abc4b2a76b9719d911017c592");
     }
-
 
     #[test]
     fn test_verify_digest_without_qop() {
@@ -242,7 +240,6 @@ mod tests {
 
         assert!(!verify_digest_with_ha1(&ha1, &params));
     }
-
 
     #[test]
     fn test_auth_cache_record_failure() {

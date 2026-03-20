@@ -267,7 +267,8 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                         if result.should_log {
                             tracing::warn!(
                                 "PERMABAN IP {} - SIPVicious scanner detected in REGISTER: User-Agent='{}'",
-                                ip, user_agent
+                                ip,
+                                user_agent
                             );
                         }
                     }

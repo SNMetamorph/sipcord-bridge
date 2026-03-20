@@ -18,18 +18,18 @@ use crate::fax::session::FaxSession;
 use crate::fax::spandsp::FaxT38Receiver;
 use crate::routing::{Backend, CallError, CallStartedInfo, OutboundCallRequest, RouteDecision};
 use crate::services::snowflake::Snowflake;
-use crate::services::sound::{create_sound_manager, SoundManager};
+use crate::services::sound::{SoundManager, create_sound_manager};
 use crate::transport::discord::{
-    register_discord_to_sip_producer, unregister_discord_to_sip_producer, DiscordEvent,
-    DiscordVoiceConnection, SharedDiscordClient,
+    DiscordEvent, DiscordVoiceConnection, SharedDiscordClient, register_discord_to_sip_producer,
+    unregister_discord_to_sip_producer,
 };
 use crate::transport::sip::{
-    cleanup_channel_port, clear_channel_stale_audio, empty_bridge_grace_period_secs,
-    register_call_channel, register_discord_to_sip, stop_loop, unregister_call_channel,
-    unregister_discord_to_sip, CallId, SipCommand, SipEvent, CONF_SAMPLE_RATE,
+    CONF_SAMPLE_RATE, CallId, SipCommand, SipEvent, cleanup_channel_port,
+    clear_channel_stale_audio, empty_bridge_grace_period_secs, register_call_channel,
+    register_discord_to_sip, stop_loop, unregister_call_channel, unregister_discord_to_sip,
 };
 use anyhow::Result;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -332,7 +332,9 @@ impl BridgeCoordinator {
                                         bridge.sip_calls.remove(&call_id);
                                         info!(
                                             "Removed call {} from bridge for channel {} ({} callers remaining)",
-                                            call_id, channel_id, bridge.sip_calls.len()
+                                            call_id,
+                                            channel_id,
+                                            bridge.sip_calls.len()
                                         );
                                         bridge.sip_calls.is_empty()
                                     } else {
@@ -464,7 +466,14 @@ impl BridgeCoordinator {
                     } => {
                         info!(
                             "T.38 re-INVITE for call {}: remote={}:{}, local_port={}, version={}, rate={}bps, mgmt={}, ec={}",
-                            call_id, remote_ip, remote_port, local_port, t38_version, max_bit_rate, rate_management, udp_ec
+                            call_id,
+                            remote_ip,
+                            remote_port,
+                            local_port,
+                            t38_version,
+                            max_bit_rate,
+                            rate_management,
+                            udp_ec
                         );
 
                         // Check if this call has a fax session
@@ -671,7 +680,11 @@ impl BridgeCoordinator {
                     if check_count.is_multiple_of(12) {
                         info!(
                             "Health check #{}: channel={}, healthy={}, queue={}%, overflows={}, reconnects={}",
-                            check_count, channel_id, is_healthy, queue_fill, consecutive_overflows,
+                            check_count,
+                            channel_id,
+                            is_healthy,
+                            queue_fill,
+                            consecutive_overflows,
                             bridge.reconnect_attempts
                         );
                     }
@@ -694,7 +707,9 @@ impl BridgeCoordinator {
                         if bridge.reconnect_attempts >= bridge_cfg.reconnect_max_attempts {
                             error!(
                                 "Bridge for channel {} exceeded max reconnection attempts ({}/{}), tearing down",
-                                channel_id, bridge.reconnect_attempts, bridge_cfg.reconnect_max_attempts
+                                channel_id,
+                                bridge.reconnect_attempts,
+                                bridge_cfg.reconnect_max_attempts
                             );
                             exhausted_bridges.push(channel_id);
                             continue;
@@ -815,7 +830,8 @@ impl BridgeCoordinator {
                 if unhealthy_bridges.len() > max_per_cycle {
                     warn!(
                         "Rate limiting reconnections: {} unhealthy bridges but only processing {} per cycle",
-                        unhealthy_bridges.len(), max_per_cycle
+                        unhealthy_bridges.len(),
+                        max_per_cycle
                     );
                     unhealthy_bridges.truncate(max_per_cycle);
                 }
@@ -855,7 +871,10 @@ impl BridgeCoordinator {
                             Ok(new_connection) => {
                                 info!(
                                     "Successfully reconnected bridge {} for channel {} (attempt {}/{})",
-                                    new_bridge_id, channel_id, attempt_num, bridge_cfg.reconnect_max_attempts
+                                    new_bridge_id,
+                                    channel_id,
+                                    attempt_num,
+                                    bridge_cfg.reconnect_max_attempts
                                 );
                                 // Set up fresh ring buffers for reconnected channel
                                 setup_channel_ring_buffers(channel_id);
@@ -890,7 +909,9 @@ impl BridgeCoordinator {
                                     if !stale.is_empty() {
                                         warn!(
                                             "Removed {} stale sip_calls from reconnected bridge {}: {:?}",
-                                            stale.len(), channel_id, stale
+                                            stale.len(),
+                                            channel_id,
+                                            stale
                                         );
                                     }
                                 }
@@ -899,7 +920,10 @@ impl BridgeCoordinator {
                                 error!(
                                     "Failed to reconnect bridge for channel {} (attempt {}/{}): {}. \
                                      Bridge removed — {} SIP calls orphaned.",
-                                    channel_id, attempt_num, bridge_cfg.reconnect_max_attempts, e,
+                                    channel_id,
+                                    attempt_num,
+                                    bridge_cfg.reconnect_max_attempts,
+                                    e,
                                     sip_calls.len()
                                 );
                                 // Re-insert the bridge entry (without connection) so calls
@@ -1662,9 +1686,7 @@ async fn poll_recv<T>(rx: &Receiver<T>, name: &str, event_count: &mut u64) -> Op
                 if event_count.is_multiple_of(500) {
                     trace!(
                         "{} event handler: processed {} events, queue depth: {}",
-                        name,
-                        event_count,
-                        queue_len
+                        name, event_count, queue_len
                     );
                 }
 

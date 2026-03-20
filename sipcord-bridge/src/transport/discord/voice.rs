@@ -132,7 +132,8 @@ impl Read for StreamingAudioSource {
                 let ms_buffered = samples_available as f64 / 48000.0 / 2.0 * 1000.0;
                 tracing::info!(
                     "StreamingAudioSource: Pre-buffer complete ({} samples, {:.0}ms), starting output",
-                    samples_available, ms_buffered
+                    samples_available,
+                    ms_buffered
                 );
             } else {
                 // Still pre-buffering - return silence
@@ -157,7 +158,10 @@ impl Read for StreamingAudioSource {
             let ms_buffered = samples_available as f64 / 48000.0 / 2.0 * 1000.0;
             tracing::debug!(
                 "StreamingAudioSource #{}: ring buffer has {} samples ({:.1}ms), Songbird wants {} samples",
-                count, samples_available, ms_buffered, samples_requested
+                count,
+                samples_available,
+                ms_buffered,
+                samples_requested
             );
         }
 

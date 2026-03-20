@@ -20,17 +20,33 @@ fn main() {
     // Otherwise build from source via cmake.
     let include_paths = if let Ok(prefix) = env::var("PJPROJECT_DIR") {
         let prefix = PathBuf::from(&prefix);
-        println!("cargo:warning=Using pre-built pjproject from: {}", prefix.display());
+        println!(
+            "cargo:warning=Using pre-built pjproject from: {}",
+            prefix.display()
+        );
 
         let lib_dir = prefix.join("lib");
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
         // Link libraries in the correct dependency order (same as build-from-source path)
         let pj_libs = [
-            "pjsua-lib", "pjsua2", "pjsip-ua", "pjsip-simple", "pjsip",
-            "pjmedia-codec", "pjmedia", "pjmedia-audiodev", "pjnath",
-            "pjlib-util", "pjlib",
-            "srtp", "resample", "speex", "g7221", "gsm", "ilbc",
+            "pjsua-lib",
+            "pjsua2",
+            "pjsip-ua",
+            "pjsip-simple",
+            "pjsip",
+            "pjmedia-codec",
+            "pjmedia",
+            "pjmedia-audiodev",
+            "pjnath",
+            "pjlib-util",
+            "pjlib",
+            "srtp",
+            "resample",
+            "speex",
+            "g7221",
+            "gsm",
+            "ilbc",
         ];
         for lib in &pj_libs {
             println!("cargo:rustc-link-lib=static={}", lib);
@@ -98,10 +114,7 @@ fn main() {
             }
         }
 
-        let opus_paths = [
-            "/opt/homebrew/opt/opus/lib",
-            "/usr/local/opt/opus/lib",
-        ];
+        let opus_paths = ["/opt/homebrew/opt/opus/lib", "/usr/local/opt/opus/lib"];
         for path in &opus_paths {
             if std::path::Path::new(path).exists() {
                 println!("cargo:rustc-link-search=native={}", path);
@@ -154,18 +167,26 @@ fn main() {
 
     clang_args.push("-DPJ_AUTOCONF=1".to_string());
 
-    let pjsua_header = include_paths.iter()
+    let pjsua_header = include_paths
+        .iter()
         .find_map(|p| {
             let header = p.join("pjsua-lib/pjsua.h");
             if header.exists() {
                 return Some(header);
             }
             let header = p.join("pjsua.h");
-            if header.exists() { Some(header) } else { None }
+            if header.exists() {
+                Some(header)
+            } else {
+                None
+            }
         })
         .expect("Could not find pjsua.h header in installed location");
 
-    println!("cargo:warning=Using pjsua.h from: {}", pjsua_header.display());
+    println!(
+        "cargo:warning=Using pjsua.h from: {}",
+        pjsua_header.display()
+    );
     println!("cargo:warning=Include paths: {:?}", include_paths);
 
     let bindings = bindgen::Builder::default()
@@ -186,7 +207,10 @@ fn main() {
         .write_to_file(&bindings_path)
         .expect("Couldn't write bindings!");
 
-    println!("cargo:warning=Bindings written to: {}", bindings_path.display());
+    println!(
+        "cargo:warning=Bindings written to: {}",
+        bindings_path.display()
+    );
 }
 
 /// Build pjproject from source and return include paths.
@@ -240,17 +264,17 @@ fn build_from_source(out_dir: &PathBuf) -> Vec<PathBuf> {
 
         // Link libraries in the correct order (dependencies matter!)
         let pj_libs = [
-            "pjsua-lib",    // main pjsua library
-            "pjsua2",       // C++ wrapper (may be needed)
-            "pjsip-ua",     // SIP user agent
-            "pjsip-simple", // SIP SIMPLE presence
-            "pjsip",        // Core SIP
-            "pjmedia-codec",// Media codecs
-            "pjmedia",      // Media framework
+            "pjsua-lib",        // main pjsua library
+            "pjsua2",           // C++ wrapper (may be needed)
+            "pjsip-ua",         // SIP user agent
+            "pjsip-simple",     // SIP SIMPLE presence
+            "pjsip",            // Core SIP
+            "pjmedia-codec",    // Media codecs
+            "pjmedia",          // Media framework
             "pjmedia-audiodev", // Audio device
-            "pjnath",       // NAT traversal
-            "pjlib-util",   // Utility functions
-            "pjlib",        // Core library
+            "pjnath",           // NAT traversal
+            "pjlib-util",       // Utility functions
+            "pjlib",            // Core library
             // Third party
             "srtp",
             "resample",
@@ -288,7 +312,11 @@ fn build_from_source(out_dir: &PathBuf) -> Vec<PathBuf> {
     include_paths
 }
 
-fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path::Path, pjproject_install: &std::path::Path) {
+fn build_pjproject(
+    pjproject_src: &std::path::Path,
+    pjproject_build: &std::path::Path,
+    pjproject_install: &std::path::Path,
+) {
     // Check for .pc file in build dir (CMake install doesn't always copy it to install dir)
     let pc_file = pjproject_build.join("libpjproject.pc");
 
@@ -305,7 +333,8 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
         let mut c_flags: Vec<&str> = vec!["-DPJSUA_MAX_CALLS=128"];
 
         let mut cmake_args = vec![
-            "-G".to_string(), "Unix Makefiles".to_string(),
+            "-G".to_string(),
+            "Unix Makefiles".to_string(),
             format!("-DCMAKE_INSTALL_PREFIX={}", pjproject_install.display()),
             "-DCMAKE_BUILD_TYPE=Release".to_string(),
             "-DBUILD_SHARED_LIBS=OFF".to_string(),
@@ -342,7 +371,12 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
                 let cxx = format!("{}-g++", cross_prefix);
 
                 // Check if cross-compiler exists
-                if std::process::Command::new("which").arg(&cc).output().map(|o| o.status.success()).unwrap_or(false) {
+                if std::process::Command::new("which")
+                    .arg(&cc)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+                {
                     cmake_args.push(format!("-DCMAKE_C_COMPILER={}", cc));
                     cmake_args.push(format!("-DCMAKE_CXX_COMPILER={}", cxx));
                     println!("cargo:warning=Using cross-compiler: {}", cc);
@@ -353,7 +387,9 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
                     if target.contains("aarch64") {
                         c_flags.push("-mno-outline-atomics");
                         c_flags.push("-DPJ_POOL_ALIGNMENT=8");
-                        println!("cargo:warning=ARM64: Using inline atomics with 8-byte pool alignment");
+                        println!(
+                            "cargo:warning=ARM64: Using inline atomics with 8-byte pool alignment"
+                        );
                     }
 
                     // The cross-compiler (from crossbuild-essential-arm64) has --sysroot=/usr/aarch64-linux-gnu
@@ -371,7 +407,10 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
                         cmake_args.push("-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH".to_string());
                         cmake_args.push("-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH".to_string());
                         cmake_args.push("-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER".to_string());
-                        println!("cargo:warning=Using multiarch library path: {}", multiarch_lib);
+                        println!(
+                            "cargo:warning=Using multiarch library path: {}",
+                            multiarch_lib
+                        );
 
                         // Explicitly set OpenSSL paths for cross-compilation
                         let openssl_ssl = format!("{}/libssl.so", multiarch_lib);
@@ -381,7 +420,10 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
                             cmake_args.push("-DOPENSSL_INCLUDE_DIR=/usr/include".to_string());
                             cmake_args.push(format!("-DOPENSSL_SSL_LIBRARY={}", openssl_ssl));
                             cmake_args.push(format!("-DOPENSSL_CRYPTO_LIBRARY={}", openssl_crypto));
-                            println!("cargo:warning=Using cross-compiled OpenSSL from {}", multiarch_lib);
+                            println!(
+                                "cargo:warning=Using cross-compiled OpenSSL from {}",
+                                multiarch_lib
+                            );
                         }
 
                         // Explicitly set Opus paths for cross-compilation
@@ -389,7 +431,10 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
                         if std::path::Path::new(&opus_lib).exists() {
                             cmake_args.push("-DOPUS_INCLUDE_DIR=/usr/include".to_string());
                             cmake_args.push(format!("-DOPUS_LIBRARY={}", opus_lib));
-                            println!("cargo:warning=Using cross-compiled Opus from {}", multiarch_lib);
+                            println!(
+                                "cargo:warning=Using cross-compiled Opus from {}",
+                                multiarch_lib
+                            );
                         }
                     }
                 }
@@ -409,7 +454,10 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
 
             for prefix in &openssl_prefixes {
                 let include_path = format!("{}/include", prefix);
-                if std::path::Path::new(&include_path).join("openssl/ssl.h").exists() {
+                if std::path::Path::new(&include_path)
+                    .join("openssl/ssl.h")
+                    .exists()
+                {
                     println!("cargo:warning=Found OpenSSL at: {}", prefix);
                     cmake_args.push(format!("-DOPENSSL_ROOT_DIR={}", prefix));
                     if cfg!(target_os = "macos") {
@@ -428,17 +476,17 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
 
             // Native build - find Opus codec library
             let opus_prefixes = if cfg!(target_os = "macos") {
-                vec![
-                    "/opt/homebrew/opt/opus",
-                    "/usr/local/opt/opus",
-                ]
+                vec!["/opt/homebrew/opt/opus", "/usr/local/opt/opus"]
             } else {
                 vec!["/usr", "/usr/local"]
             };
 
             for prefix in &opus_prefixes {
                 let include_path = format!("{}/include", prefix);
-                if std::path::Path::new(&include_path).join("opus/opus.h").exists() {
+                if std::path::Path::new(&include_path)
+                    .join("opus/opus.h")
+                    .exists()
+                {
                     println!("cargo:warning=Found Opus at: {}", prefix);
                     cmake_args.push(format!("-DOPUS_INCLUDE_DIR={}", include_path));
                     let lib_path = format!("{}/lib", prefix);
@@ -473,8 +521,14 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
             .expect("Failed to run cmake configure");
 
         if !cmake_result.status.success() {
-            eprintln!("CMake configure stdout: {}", String::from_utf8_lossy(&cmake_result.stdout));
-            eprintln!("CMake configure stderr: {}", String::from_utf8_lossy(&cmake_result.stderr));
+            eprintln!(
+                "CMake configure stdout: {}",
+                String::from_utf8_lossy(&cmake_result.stdout)
+            );
+            eprintln!(
+                "CMake configure stderr: {}",
+                String::from_utf8_lossy(&cmake_result.stderr)
+            );
             panic!("CMake configure failed");
         }
 
@@ -484,17 +538,36 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
             .unwrap_or(4);
 
         // Run CMake build - only build the libraries we need, not sample apps
-        println!("cargo:warning=Compiling pjproject with {} threads...", num_cpus);
+        println!(
+            "cargo:warning=Compiling pjproject with {} threads...",
+            num_cpus
+        );
         let mut build_args = vec![
-            "--build".to_string(), ".".to_string(),
-            "--config".to_string(), "Release".to_string(),
+            "--build".to_string(),
+            ".".to_string(),
+            "--config".to_string(),
+            "Release".to_string(),
         ];
 
         // Specify only the library targets we need
         let targets = [
-            "pjlib", "pjlib-util", "pjnath", "pjmedia", "pjmedia-audiodev",
-            "pjmedia-codec", "pjsip", "pjsip-simple", "pjsip-ua", "pjsua-lib", "pjsua2",
-            "resample", "srtp", "speex", "g7221", "gsm", "ilbc",
+            "pjlib",
+            "pjlib-util",
+            "pjnath",
+            "pjmedia",
+            "pjmedia-audiodev",
+            "pjmedia-codec",
+            "pjsip",
+            "pjsip-simple",
+            "pjsip-ua",
+            "pjsua-lib",
+            "pjsua2",
+            "resample",
+            "srtp",
+            "speex",
+            "g7221",
+            "gsm",
+            "ilbc",
         ];
         for target in &targets {
             build_args.push("--target".to_string());
@@ -510,8 +583,14 @@ fn build_pjproject(pjproject_src: &std::path::Path, pjproject_build: &std::path:
             .expect("Failed to run cmake build");
 
         if !build_result.status.success() {
-            eprintln!("CMake build stdout: {}", String::from_utf8_lossy(&build_result.stdout));
-            eprintln!("CMake build stderr: {}", String::from_utf8_lossy(&build_result.stderr));
+            eprintln!(
+                "CMake build stdout: {}",
+                String::from_utf8_lossy(&build_result.stdout)
+            );
+            eprintln!(
+                "CMake build stderr: {}",
+                String::from_utf8_lossy(&build_result.stderr)
+            );
             panic!("CMake build failed");
         }
         println!("cargo:warning=Library builds complete");

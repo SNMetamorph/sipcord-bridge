@@ -803,7 +803,6 @@ pub unsafe extern "C" fn on_rx_response_nat_fixup_cb(rdata: *mut pjsip_rx_data) 
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_is_rfc1918_10_network() {
         assert!(is_rfc1918(Ipv4Addr::new(10, 0, 0, 1)));
@@ -830,7 +829,6 @@ mod tests {
         assert!(!is_rfc1918(Ipv4Addr::new(192, 167, 1, 1)));
         assert!(!is_rfc1918(Ipv4Addr::new(1, 1, 1, 1)));
     }
-
 
     #[test]
     fn test_sanitize_sdp_orphan_dynamic_pt_stripped() {

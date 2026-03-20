@@ -61,7 +61,9 @@ pub fn parse_wav(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
                 debug!("WAV format: {:?}", format);
             }
             b"data" => {
-                let fmt = format.as_ref().ok_or_else(|| anyhow::anyhow!("data chunk before fmt chunk"))?;
+                let fmt = format
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("data chunk before fmt chunk"))?;
                 ensure!(fmt.audio_format == 1, "Only PCM format supported");
                 ensure!(fmt.bits_per_sample == 16, "Only 16-bit samples supported");
 

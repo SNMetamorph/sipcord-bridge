@@ -125,11 +125,7 @@ pub unsafe fn extract_user_agent(rdata: *const pjsip_rx_data) -> Option<String> 
 
     // Extract the header value
     let value = pj_str_to_string(&(*str_hdr).hvalue);
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 /// Check if User-Agent indicates a SIPVicious scanner or similar tool
@@ -192,19 +188,11 @@ pub unsafe fn extract_digest_auth_from_rdata(
         method: String::new(), // Will be set by caller
         qop: {
             let qop = pj_str_to_string(&digest.qop);
-            if qop.is_empty() {
-                None
-            } else {
-                Some(qop)
-            }
+            if qop.is_empty() { None } else { Some(qop) }
         },
         nc: {
             let nc = pj_str_to_string(&digest.nc);
-            if nc.is_empty() {
-                None
-            } else {
-                Some(nc)
-            }
+            if nc.is_empty() { None } else { Some(nc) }
         },
         cnonce: {
             let cnonce = pj_str_to_string(&digest.cnonce);
@@ -451,7 +439,9 @@ pub unsafe extern "C" fn on_incoming_call_cb(
                         if result.should_log {
                             tracing::warn!(
                                 "PERMABAN IP {} - SIPVicious scanner detected: User-Agent='{}' (call {})",
-                                ip, user_agent, call_id
+                                ip,
+                                user_agent,
+                                call_id
                             );
                         }
                     }
@@ -511,7 +501,11 @@ pub unsafe extern "C" fn on_incoming_call_cb(
                     if result.should_log {
                         tracing::warn!(
                             "Timed out IP {} for suspicious extension: {} (call {}, offense_level={}, timeout={}s)",
-                            ip, extension, call_id, result.offense_level, result.timeout_secs
+                            ip,
+                            extension,
+                            call_id,
+                            result.offense_level,
+                            result.timeout_secs
                         );
                     }
                 }
@@ -794,7 +788,13 @@ pub unsafe extern "C" fn on_call_media_state_cb(raw_call_id: pjsua_call_id) {
 
         tracing::info!(
             "Call {} MEDIA ACTIVE: conf_port={}, media_dir={}, media_cnt={}, call_state={}, pending_channel={:?}, codec={}",
-            call_id, conf_port, dir, ci.media_cnt, ci.state, pending_channel, codec_info
+            call_id,
+            conf_port,
+            dir,
+            ci.media_cnt,
+            ci.state,
+            pending_channel,
+            codec_info
         );
 
         if conf_port.is_valid() {
@@ -824,7 +824,9 @@ pub unsafe extern "C" fn on_call_media_state_cb(raw_call_id: pjsua_call_id) {
                 if old_port != conf_port {
                     tracing::info!(
                         "Call {} conf_port changed from {} to {} (media renegotiation), reconnecting",
-                        call_id, old_port, conf_port
+                        call_id,
+                        old_port,
+                        conf_port
                     );
 
                     // Get the channel this call is registered with
@@ -887,7 +889,11 @@ pub unsafe extern "C" fn on_call_media_state_cb(raw_call_id: pjsua_call_id) {
 
                             tracing::info!(
                                 "Reconnected call {} (new port {}) <-> call {} (port {}) in channel {}",
-                                call_id, conf_port, other_id, other_port, channel_id
+                                call_id,
+                                conf_port,
+                                other_id,
+                                other_port,
+                                channel_id
                             );
                         }
                     }

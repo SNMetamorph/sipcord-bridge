@@ -79,7 +79,7 @@ pub unsafe extern "C" fn direct_player_on_destroy(this_port: *mut pjmedia_port) 
 /// This queues the operation to be executed by the audio thread to avoid
 /// deadlocks with the audio thread's pjsua_conf_connect/disconnect calls.
 pub fn play_audio_to_call_direct(call_id: CallId, samples: &[i16]) -> Result<()> {
-    use super::types::{queue_pjsua_op, PendingPjsuaOp};
+    use super::types::{PendingPjsuaOp, queue_pjsua_op};
 
     tracing::debug!(
         "Queueing PlayDirect for call {} ({} samples)",
@@ -96,7 +96,7 @@ pub fn play_audio_to_call_direct(call_id: CallId, samples: &[i16]) -> Result<()>
 /// Internal implementation of play_audio_to_call_direct
 /// Called from the audio thread to actually create and connect the player
 pub fn play_audio_to_call_direct_internal(call_id: CallId, samples: &[i16]) -> Result<()> {
-    use super::frame_utils::{create_and_connect_port, PortCallbacks};
+    use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
     // Get call's conference port
     let call_conf_port = CALL_CONF_PORTS

@@ -6,7 +6,7 @@
 //! Huffman table data derived from the ITU-T T.4 standard.
 //! Bit-reading approach inspired by the `fax` crate (MIT licensed).
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use image::GrayImage;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -1289,9 +1289,7 @@ mod tests {
         // When lines.len() == declared height, nothing changes
         let width = 10u32;
         let height = 50u32;
-        let lines: Vec<Vec<u16>> = (0..50)
-            .map(|_| vec![5, 10])
-            .collect();
+        let lines: Vec<Vec<u16>> = (0..50).map(|_| vec![5, 10]).collect();
 
         let img = assemble_image(&lines, width, height, 0);
         assert_eq!(img.height(), 50);

@@ -13,9 +13,9 @@ use parking_lot::{Mutex, RwLock};
 use pjsua::*;
 use rtrb::Consumer;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 // Discord→SIP ring buffer consumers (written by Discord, read by audio thread)
@@ -112,7 +112,10 @@ pub unsafe extern "C" fn channel_port_get_frame(
             if call_count.is_multiple_of(500) {
                 tracing::trace!(
                     "channel_port_get_frame #{}: CACHE HIT for channel={} ({}ms since last drain, {} total hits)",
-                    call_count, channel_id, now.duration_since(*last_time).as_millis(), hits
+                    call_count,
+                    channel_id,
+                    now.duration_since(*last_time).as_millis(),
+                    hits
                 );
             }
             (cached.as_ptr(), *cached_len)
@@ -211,7 +214,10 @@ fn get_samples_from_buffer(channel_id: Snowflake, buf: &mut [i16; SAMPLES_PER_FR
                 if underruns <= 10 || underruns.is_multiple_of(100) {
                     tracing::warn!(
                         "BUFFER UNDERRUN (Discord->SIP): channel={}, only {} available (need {}), total: {}",
-                        channel_id, available, SAMPLES_PER_FRAME, underruns
+                        channel_id,
+                        available,
+                        SAMPLES_PER_FRAME,
+                        underruns
                     );
                 }
                 buf[available..].fill(0);
@@ -501,7 +507,8 @@ pub fn register_call_channel(call_id: CallId, channel_id: Snowflake) {
     PENDING_CONF_CONNECTIONS.push((call_id, channel_id));
     tracing::debug!(
         "Queued conference connections for call {} -> channel {} (will be processed by audio thread)",
-        call_id, channel_id
+        call_id,
+        channel_id
     );
 }
 

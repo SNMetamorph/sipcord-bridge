@@ -153,7 +153,7 @@ pub fn start_streaming_to_call(
     path: &Path,
     hangup_on_complete: bool,
 ) -> Result<()> {
-    use super::frame_utils::{create_and_connect_port, PortCallbacks};
+    use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
     // Create the streaming player
     let player = StreamingPlayer::new(path)?;

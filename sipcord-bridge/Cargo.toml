@@ -1,7 +1,11 @@
 [package]
 name = "sipcord-bridge"
 version = "1.5.5"
-edition = "2021"
+edition = "2024"
+authors.workspace = true
+license = "AGPL-3.0-only"
+repository.workspace = true
+homepage.workspace = true
 publish = false
 
 [[bin]]

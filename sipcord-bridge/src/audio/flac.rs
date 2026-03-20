@@ -2,7 +2,7 @@
 //!
 //! Parses FLAC file bytes to extract raw PCM i16 samples.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use tracing::debug;
 
 /// Parse a FLAC file and return the raw PCM i16 samples (mono).

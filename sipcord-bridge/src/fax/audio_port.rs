@@ -6,18 +6,18 @@
 //!
 //! This is analogous to the channel_audio.rs ports used for Discord↔SIP audio.
 
-use crate::transport::sip::ffi::types::{
-    ConfPort, SendablePool, SendablePort, CALL_CONF_PORTS, CONF_CHANNELS, CONF_SAMPLE_RATE,
-    SAMPLES_PER_FRAME,
-};
 use crate::transport::sip::CallId;
+use crate::transport::sip::ffi::types::{
+    CALL_CONF_PORTS, CONF_CHANNELS, CONF_SAMPLE_RATE, ConfPort, SAMPLES_PER_FRAME, SendablePool,
+    SendablePort,
+};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use pjsua::*;
 use rtrb::{Consumer, Producer};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, warn};
 
 /// Ring buffer capacity for fax audio (i16 mono @ 16kHz).
@@ -180,7 +180,7 @@ pub async fn create_fax_audio_port(call_id: CallId) -> Option<FaxAudioPorts> {
     // Queue the bidirectional conference connection to the audio thread
     // This avoids racing with pjmedia_port_get_frame
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    use crate::transport::sip::ffi::types::{queue_pjsua_op, PendingPjsuaOp};
+    use crate::transport::sip::ffi::types::{PendingPjsuaOp, queue_pjsua_op};
     queue_pjsua_op(PendingPjsuaOp::ConnectFaxPort {
         call_id,
         fax_slot: conf_slot,

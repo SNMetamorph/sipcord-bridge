@@ -27,7 +27,11 @@ fn drain_queue<T>(queue: &SegQueue<T>, name: &str) {
         count += 1;
     }
     if count > 0 {
-        tracing::warn!("Drained {} stale {} from previous audio thread", count, name);
+        tracing::warn!(
+            "Drained {} stale {} from previous audio thread",
+            count,
+            name
+        );
     }
 }
 
@@ -121,7 +125,9 @@ pub fn start_audio_thread() {
                 // clocked when we make connections via pjsua_conf_connect.
                 if frame_count == 1 {
                     AUDIO_THREAD_READY.store(true, Ordering::SeqCst);
-                    tracing::debug!("Audio thread ready after first frame, processing pending channel completions");
+                    tracing::debug!(
+                        "Audio thread ready after first frame, processing pending channel completions"
+                    );
                     process_pending_channel_completions();
                 }
 
@@ -141,7 +147,9 @@ pub fn start_audio_thread() {
                 if processing_ms > FRAME_PTIME_MS as f64 {
                     tracing::warn!(
                         "AUDIO OVERRUN: Frame #{} processing took {:.2}ms (>{}ms), audio will crunch!",
-                        frame_count, processing_ms, FRAME_PTIME_MS
+                        frame_count,
+                        processing_ms,
+                        FRAME_PTIME_MS
                     );
                 } else if processing_ms > (FRAME_PTIME_MS as f64 * 0.8) {
                     // Warn if approaching the limit (>80% of frame time)
