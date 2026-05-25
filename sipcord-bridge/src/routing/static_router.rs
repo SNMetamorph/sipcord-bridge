@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::info;
 
+use crate::config::ConfigError;
 use crate::routing::{Backend, CallError, CallStartedInfo, OutboundCallRequest, RouteDecision};
 use crate::services::snowflake::Snowflake;
 use crate::transport::sip::DigestAuthParams;
@@ -46,11 +47,15 @@ pub struct StaticBackend {
 
 impl StaticBackend {
     /// Load the dialplan from a TOML file. `bot_token` comes from the environment.
-    pub fn load(path: &Path, bot_token: String) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
-        let dialplan: Dialplan = toml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
+    pub fn load(path: &Path, bot_token: String) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let dialplan: Dialplan = toml::from_str(&content).map_err(|source| ConfigError::TomlParse {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
         info!(
             "Loaded dialplan from {} ({} extensions)",

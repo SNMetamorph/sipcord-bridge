@@ -3,8 +3,8 @@
 //! This module provides one-shot audio playback (e.g., join sounds) that
 //! bypasses the channel buffer and plays directly to a specific call.
 
+use crate::transport::sip::error::SipAudioError;
 use super::types::*;
-use anyhow::Result;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::collections::HashMap;
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn direct_player_on_destroy(this_port: *mut pjmedia_port) 
 ///
 /// This queues the operation to be executed by the audio thread to avoid
 /// deadlocks with the audio thread's pjsua_conf_connect/disconnect calls.
-pub fn play_audio_to_call_direct(call_id: CallId, samples: &[i16]) -> Result<()> {
+pub fn play_audio_to_call_direct(call_id: CallId, samples: &[i16]) -> Result<(), SipAudioError> {
     use super::types::{PendingPjsuaOp, queue_pjsua_op};
 
     tracing::debug!(
@@ -103,14 +103,17 @@ pub fn play_audio_to_call_direct(call_id: CallId, samples: &[i16]) -> Result<()>
 
 /// Internal implementation of play_audio_to_call_direct
 /// Called from the audio thread to actually create and connect the player
-pub fn play_audio_to_call_direct_internal(call_id: CallId, samples: &[i16]) -> Result<()> {
+pub fn play_audio_to_call_direct_internal(
+    call_id: CallId,
+    samples: &[i16],
+) -> Result<(), SipAudioError> {
     use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
     // Get call's conference port
     let call_conf_port = CALL_CONF_PORTS
         .get()
         .and_then(|p| p.get(&call_id).map(|r| *r))
-        .ok_or_else(|| anyhow::anyhow!("No conf_port for call {}", call_id))?;
+        .ok_or(SipAudioError::NoConfPort { call_id })?;
 
     // Store samples in the player state BEFORE creating port (get_frame needs them)
     // We'll clean up if port creation fails

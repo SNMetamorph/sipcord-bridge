@@ -1,7 +1,33 @@
-use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// Errors that can occur loading and validating bridge configuration.
+#[derive(thiserror::Error, Debug)]
+pub enum ConfigError {
+    #[error("failed to read config file {path:?}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse config file {path:?}: {source}")]
+    TomlParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("failed to parse environment variables: {0}")]
+    Envy(#[from] envy::Error),
+
+    #[error("global EnvConfig has already been initialised")]
+    EnvAlreadyInitialised,
+
+    #[error("required environment variable {0} is not set")]
+    MissingEnvVar(&'static str),
+}
 
 /// Global application config (loaded from config.toml)
 pub static APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
@@ -85,30 +111,29 @@ pub struct EnvConfig {
 impl EnvConfig {
     /// Parse environment variables (via `envy`) and store in the global `OnceLock`.
     /// Call once at the top of `main()`.
-    pub fn init() -> Result<()> {
+    pub fn init() -> Result<(), ConfigError> {
         dotenvy::dotenv().ok();
-        let cfg: EnvConfig =
-            envy::from_env().context("Failed to parse environment variables into EnvConfig")?;
+        let cfg: EnvConfig = envy::from_env()?;
         ENV_CONFIG
             .set(cfg)
-            .ok()
-            .context("EnvConfig already initialized")?;
+            .map_err(|_| ConfigError::EnvAlreadyInitialised)?;
         Ok(())
     }
 
-    /// Access the global `EnvConfig` (panics if `init()` was not called).
+    /// Access the global `EnvConfig` (panics if `init()` was not called — a
+    /// programmer error, not a recoverable condition).
     pub fn global() -> &'static EnvConfig {
-        ENV_CONFIG
-            .get()
-            .expect("EnvConfig not initialized — call EnvConfig::init() first")
+        ENV_CONFIG.get().unwrap_or_else(|| {
+            panic!("EnvConfig not initialized — call EnvConfig::init() first")
+        })
     }
 
     /// Build a `SipConfig` from the parsed environment.
-    pub fn to_sip_config(&self) -> Result<SipConfig> {
+    pub fn to_sip_config(&self) -> Result<SipConfig, ConfigError> {
         let public_host = self
             .sip_public_host
             .clone()
-            .context("SIP_PUBLIC_HOST required")?;
+            .ok_or(ConfigError::MissingEnvVar("SIP_PUBLIC_HOST"))?;
 
         let local_net = match (&self.sip_local_host, &self.sip_local_cidr) {
             (Some(host), Some(cidr)) => Some(LocalNetConfig {
@@ -299,18 +324,23 @@ pub struct SoundEntry {
 
 impl AppConfig {
     /// Load configuration from a TOML file
-    pub fn load(path: &Path) -> Result<Self> {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        toml::from_str(&contents)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&contents).map_err(|source| ConfigError::TomlParse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 
-    /// Get the global application config (panics if not initialized)
+    /// Get the global application config (panics if not initialized — a
+    /// programmer error: caller must `AppConfig::load(...)` first).
     pub fn global() -> &'static AppConfig {
-        APP_CONFIG
-            .get()
-            .expect("AppConfig not initialized - call AppConfig::load() first")
+        APP_CONFIG.get().unwrap_or_else(|| {
+            panic!("AppConfig not initialized — call AppConfig::load() first")
+        })
     }
 
     /// Get bridge config (with defaults if not loaded yet)
@@ -370,7 +400,7 @@ pub struct LocalNetConfig {
 impl SipConfig {
     /// Load SIP configuration from environment variables.
     /// Standalone method for backends that don't need the full Config.
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self, ConfigError> {
         EnvConfig::global().to_sip_config()
     }
 }

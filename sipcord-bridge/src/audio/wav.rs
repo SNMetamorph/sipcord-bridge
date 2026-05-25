@@ -3,8 +3,16 @@
 //! Parses WAV file bytes to extract raw PCM i16 samples.
 //! Supports standard PCM WAV files (format code 1).
 
-use anyhow::ensure;
+use super::AudioParseError;
 use tracing::debug;
+
+fn ensure(cond: bool, msg: &'static str) -> Result<(), AudioParseError> {
+    if cond {
+        Ok(())
+    } else {
+        Err(AudioParseError::Malformed(msg.into()))
+    }
+}
 
 /// WAV format chunk data
 #[derive(Debug)]
@@ -25,11 +33,11 @@ struct WavFormat {
 /// - Standard PCM WAV files (format code 1)
 /// - Stereo to mono conversion (if needed)
 /// - 16-bit samples
-pub fn parse_wav(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
+pub fn parse_wav(data: &[u8]) -> Result<(Vec<i16>, u32), AudioParseError> {
     // Validate RIFF header
-    ensure!(data.len() >= 12, "WAV file too short for header");
-    ensure!(&data[0..4] == b"RIFF", "Missing RIFF header");
-    ensure!(&data[8..12] == b"WAVE", "Missing WAVE format");
+    ensure(data.len() >= 12, "WAV file too short for header")?;
+    ensure(&data[0..4] == b"RIFF", "missing RIFF header")?;
+    ensure(&data[8..12] == b"WAVE", "missing WAVE format")?;
 
     let mut pos = 12;
     let mut format: Option<WavFormat> = None;
@@ -45,7 +53,7 @@ pub fn parse_wav(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
 
         match chunk_id {
             b"fmt " => {
-                ensure!(chunk_size >= 16, "fmt chunk too small");
+                ensure(chunk_size >= 16, "fmt chunk too small")?;
                 format = Some(WavFormat {
                     audio_format: u16::from_le_bytes([data[pos], data[pos + 1]]),
                     num_channels: u16::from_le_bytes([data[pos + 2], data[pos + 3]]),
@@ -63,9 +71,19 @@ pub fn parse_wav(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
             b"data" => {
                 let fmt = format
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("data chunk before fmt chunk"))?;
-                ensure!(fmt.audio_format == 1, "Only PCM format supported");
-                ensure!(fmt.bits_per_sample == 16, "Only 16-bit samples supported");
+                    .ok_or_else(|| AudioParseError::Malformed("data chunk before fmt chunk".into()))?;
+                if fmt.audio_format != 1 {
+                    return Err(AudioParseError::Unsupported(format!(
+                        "WAV audio_format={} (only PCM=1 supported)",
+                        fmt.audio_format
+                    )));
+                }
+                if fmt.bits_per_sample != 16 {
+                    return Err(AudioParseError::Unsupported(format!(
+                        "WAV bits_per_sample={} (only 16 supported)",
+                        fmt.bits_per_sample
+                    )));
+                }
 
                 let data_end = (pos + chunk_size).min(data.len());
                 let sample_data = &data[pos..data_end];
@@ -115,7 +133,7 @@ pub fn parse_wav(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
     let sample_rate = format
         .as_ref()
         .map(|f| f.sample_rate)
-        .ok_or_else(|| anyhow::anyhow!("No fmt chunk found"))?;
+        .ok_or_else(|| AudioParseError::Malformed("no fmt chunk found".into()))?;
 
     Ok((samples, sample_rate))
 }

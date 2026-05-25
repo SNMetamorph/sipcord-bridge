@@ -3,11 +3,11 @@
 //! Provides common helpers for filling audio frames and a shared no-op
 //! put_frame callback used by ports that only produce audio.
 
+use crate::transport::sip::error::SipAudioError;
 use super::types::{
     CONF_CHANNELS, CONF_MASTER_PORT, CONF_SAMPLE_RATE, CallId, ConfPort, SAMPLES_PER_FRAME,
     SendablePool,
 };
-use anyhow::Result;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::sync::OnceLock;
@@ -120,7 +120,7 @@ pub unsafe fn create_and_connect_port(
     signature: u32,
     callbacks: PortCallbacks,
     call_conf_port: ConfPort,
-) -> Result<ConfPortGuard> {
+) -> Result<ConfPortGuard, SipAudioError> {
     // Get or create the memory pool
     let pool = pool.get_or_init(|| {
         let p = unsafe { pjsua_pool_create(pool_name.as_ptr() as *const _, 4096, 4096) };
@@ -132,18 +132,16 @@ pub unsafe fn create_and_connect_port(
     let port_size = std::mem::size_of::<pjmedia_port>();
     let port = unsafe { pj_pool_alloc(pool_ptr, port_size) as *mut pjmedia_port };
     if port.is_null() {
-        anyhow::bail!(
-            "Failed to allocate {} port for call {}",
-            name_prefix,
-            call_id
-        );
+        return Err(SipAudioError::FrameMismatch(format!(
+            "failed to allocate {} port for call {}",
+            name_prefix, call_id
+        )));
     }
     unsafe { std::ptr::write_bytes(port as *mut u8, 0, port_size) };
 
     // Create port name
     let port_name = format!("{}{}", name_prefix, call_id);
-    let port_name_cstr = std::ffi::CString::new(port_name)
-        .map_err(|e| anyhow::anyhow!("Invalid port name: {}", e))?;
+    let port_name_cstr = std::ffi::CString::new(port_name)?;
 
     // Initialize port info
     unsafe {
@@ -167,21 +165,30 @@ pub unsafe fn create_and_connect_port(
     let mut player_slot: i32 = 0;
     let status = unsafe { pjsua_conf_add_port(pool_ptr, port, &mut player_slot) };
     if status != pj_constants__PJ_SUCCESS as i32 {
-        anyhow::bail!("Failed to add {} port to conf: {}", name_prefix, status);
+        return Err(SipAudioError::Pjsua {
+            operation: "pjsua_conf_add_port",
+            status,
+        });
     }
 
     // Connect player port to the target call's port
     let conf = unsafe { get_conference_bridge() };
     let Some(conf) = conf else {
         unsafe { pjsua_conf_remove_port(player_slot) };
-        anyhow::bail!("Failed to get conference bridge for {} port", name_prefix);
+        return Err(SipAudioError::FrameMismatch(format!(
+            "no conference bridge available for {} port",
+            name_prefix
+        )));
     };
 
     let status =
         unsafe { pjmedia_conf_connect_port(conf, player_slot as u32, *call_conf_port as u32, 0) };
     if status != pj_constants__PJ_SUCCESS as i32 {
         unsafe { pjsua_conf_remove_port(player_slot) };
-        anyhow::bail!("Failed to connect {} port to call: {}", name_prefix, status);
+        return Err(SipAudioError::Pjsua {
+            operation: "pjmedia_conf_connect_port",
+            status,
+        });
     }
 
     Ok(ConfPortGuard {

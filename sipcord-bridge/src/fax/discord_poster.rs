@@ -5,8 +5,8 @@
 //! - Replaced with "Fax Received" (green) with page image gallery on success
 //! - Edited to "Fax Failed" (red) with reason on failure
 
+use super::FaxError;
 use crate::services::snowflake::Snowflake;
-use anyhow::{Context, Result};
 use serenity::all::{ChannelId, MessageId, UserId};
 use serenity::builder::{
     CreateAttachment, CreateEmbed, CreateEmbedFooter, CreateMessage, EditMessage,
@@ -30,14 +30,20 @@ pub struct DiscordPoster {
 }
 
 impl DiscordPoster {
-    pub fn new(bot_token: String, channel_id: Snowflake, user_id: String) -> Self {
-        let token: Token = bot_token.parse().expect("invalid Discord bot token");
-        Self {
+    pub fn new(
+        bot_token: String,
+        channel_id: Snowflake,
+        user_id: String,
+    ) -> Result<Self, FaxError> {
+        let token: Token = bot_token
+            .parse()
+            .map_err(|e| FaxError::InvalidToken(format!("{e}")))?;
+        Ok(Self {
             http: Arc::new(Http::new(token)),
             channel_id: ChannelId::new(*channel_id),
             user_id,
             display_name: None,
-        }
+        })
     }
 
     /// Resolve and cache the Discord display name for the user.
@@ -70,7 +76,7 @@ impl DiscordPoster {
     }
 
     /// Post a "Receiving fax..." status message. Returns the message ID for future edits.
-    pub async fn post_fax_receiving(&mut self) -> Result<u64> {
+    pub async fn post_fax_receiving(&mut self) -> Result<u64, FaxError> {
         self.resolve_display_name().await;
 
         let embed = CreateEmbed::new()
@@ -83,8 +89,7 @@ impl DiscordPoster {
             .channel_id
             .widen()
             .send_message(&self.http, CreateMessage::new().embed(embed))
-            .await
-            .context("Failed to post fax receiving message")?;
+            .await?;
 
         debug!("Posted fax receiving message: {}", msg.id);
         Ok(msg.id.get())
@@ -104,7 +109,7 @@ impl DiscordPoster {
         image_pages: Vec<Vec<u8>>,
         page_count: u32,
         file_ext: &str,
-    ) -> Result<()> {
+    ) -> Result<(), FaxError> {
         /// Discord's maximum number of embeds per message.
         const MAX_EMBEDS: u32 = 10;
 
@@ -170,14 +175,18 @@ impl DiscordPoster {
                 "Discord API error editing fax complete (msg={}, {} pages): {}",
                 message_id, page_count, e
             );
-            anyhow::bail!("Failed to edit fax complete message: {}", e);
+            return Err(FaxError::Discord(e));
         }
 
         Ok(())
     }
 
     /// Edit the status message to show a failure reason.
-    pub async fn edit_fax_failed(&self, message_id: u64, reason: &str) -> Result<()> {
+    pub async fn edit_fax_failed(
+        &self,
+        message_id: u64,
+        reason: &str,
+    ) -> Result<(), FaxError> {
         let embed = CreateEmbed::new()
             .title("Fax Failed")
             .description(reason)
@@ -201,7 +210,7 @@ impl DiscordPoster {
     }
 
     /// Post a standalone failure message (when no "receiving" message was posted).
-    pub async fn post_fax_failed(&mut self, reason: &str) -> Result<()> {
+    pub async fn post_fax_failed(&mut self, reason: &str) -> Result<(), FaxError> {
         self.resolve_display_name().await;
 
         let embed = CreateEmbed::new()

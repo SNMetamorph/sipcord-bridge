@@ -2,7 +2,7 @@
 //!
 //! Parses FLAC file bytes to extract raw PCM i16 samples.
 
-use anyhow::{Context, bail};
+use super::AudioParseError;
 use tracing::debug;
 
 /// Parse a FLAC file and return the raw PCM i16 samples (mono).
@@ -11,9 +11,9 @@ use tracing::debug;
 /// - Standard FLAC files
 /// - Stereo to mono conversion (if needed)
 /// - Various bit depths (converted to 16-bit)
-pub fn parse_flac(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
+pub fn parse_flac(data: &[u8]) -> Result<(Vec<i16>, u32), AudioParseError> {
     let cursor = std::io::Cursor::new(data);
-    let mut reader = claxon::FlacReader::new(cursor).context("Failed to create FLAC reader")?;
+    let mut reader = claxon::FlacReader::new(cursor)?;
 
     let info = reader.streaminfo();
     let sample_rate = info.sample_rate;
@@ -28,7 +28,7 @@ pub fn parse_flac(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
     // Read all samples
     let mut raw_samples: Vec<i32> = Vec::new();
     for sample in reader.samples() {
-        raw_samples.push(sample.context("Failed to read FLAC sample")?);
+        raw_samples.push(sample?);
     }
 
     // Convert to i16 based on bit depth
@@ -37,7 +37,12 @@ pub fn parse_flac(data: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
         16 => raw_samples.iter().map(|&s| s as i16).collect(),
         24 => raw_samples.iter().map(|&s| (s >> 8) as i16).collect(),
         32 => raw_samples.iter().map(|&s| (s >> 16) as i16).collect(),
-        _ => bail!("Unsupported FLAC bit depth: {}", bits_per_sample),
+        n => {
+            return Err(AudioParseError::Unsupported(format!(
+                "FLAC bit depth: {}",
+                n
+            )));
+        }
     };
 
     // Convert to mono if stereo (samples are interleaved)

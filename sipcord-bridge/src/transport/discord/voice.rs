@@ -181,8 +181,21 @@ impl Read for StreamingAudioSource {
             return Ok(buf.len());
         }
 
-        // Read samples from ring buffer directly into output buffer
-        let chunk = consumer.read_chunk(samples_to_read).unwrap();
+        // Read samples from ring buffer directly into output buffer.
+        // `samples_to_read <= samples_available` by construction, so this
+        // should never error; if rtrb's state ever desyncs, log + silence
+        // rather than panic on the audio thread.
+        let chunk = match consumer.read_chunk(samples_to_read) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "StreamingAudioSource: rtrb read_chunk unexpectedly failed ({:?}), filling with silence",
+                    e
+                );
+                buf.fill(0);
+                return Ok(buf.len());
+            }
+        };
         let (first, second) = chunk.as_slices();
 
         // Bulk copy f32 samples as raw bytes (memcpy instead of per-sample loop)

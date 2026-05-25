@@ -327,7 +327,7 @@ pub static TLS_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 pub static CALL_RTP_ACTIVITY: OnceLock<Mutex<HashMap<CallId, (u64, Instant)>>> = OnceLock::new();
 
 /// Event sender for timeout events (set during callback setup)
-pub static TIMEOUT_EVENT_TX: OnceLock<Mutex<Option<Sender<super::super::SipEvent>>>> =
+pub static TIMEOUT_EVENT_TX: OnceLock<Mutex<Option<Sender<crate::transport::sip::SipEvent>>>> =
     OnceLock::new();
 
 // Per-channel audio isolation statics

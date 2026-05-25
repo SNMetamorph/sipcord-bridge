@@ -7,12 +7,12 @@
 //! 4. On completion, TIFF is converted to PNG and posted to Discord
 //! 5. On failure or timeout, an error message is posted to Discord
 
+use crate::fax::FaxError;
 use crate::fax::discord_poster::DiscordPoster;
 use crate::fax::spandsp::{FaxReceiver, FaxRxStatus, FaxT38Receiver};
 use crate::fax::tiff_decoder;
 use crate::services::snowflake::Snowflake;
 use crate::transport::sip::CallId;
-use anyhow::Result;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -89,7 +89,7 @@ impl FaxSession {
         guild_id: Snowflake,
         user_id: String,
         bot_token: String,
-    ) -> Result<Self> {
+    ) -> Result<Self, FaxError> {
         let fax_config = crate::config::AppConfig::fax();
 
         // Use configured tmp_folder or system temp dir
@@ -109,12 +109,15 @@ impl FaxSession {
         });
 
         let tiff_dir = base_dir.join(format!("{}{}", fax_config.prefix, session_id));
-        std::fs::create_dir_all(&tiff_dir)?;
+        std::fs::create_dir_all(&tiff_dir).map_err(|source| FaxError::Io {
+            context: format!("create tiff dir {}", tiff_dir.display()),
+            source,
+        })?;
         let tiff_path = tiff_dir.join(format!("{}{}.tiff", fax_config.prefix, session_id));
 
         let receiver = FaxReceiver::new_audio_receiver(&tiff_path)?;
 
-        let poster = DiscordPoster::new(bot_token, text_channel_id, user_id.clone());
+        let poster = DiscordPoster::new(bot_token, text_channel_id, user_id.clone())?;
 
         Ok(Self {
             call_id,
@@ -278,7 +281,7 @@ impl FaxSession {
 
     /// Post the initial "Receiving fax..." message to Discord.
     /// Called when fax negotiation is detected.
-    pub async fn post_receiving_message(&mut self) -> Result<()> {
+    pub async fn post_receiving_message(&mut self) -> Result<(), FaxError> {
         match self.poster.post_fax_receiving().await {
             Ok(msg_id) => {
                 debug!(
@@ -317,7 +320,7 @@ impl FaxSession {
 
     /// Convert the received TIFF to images and post to Discord.
     /// Called after fax reception is complete.
-    pub async fn convert_and_post(&mut self) -> Result<()> {
+    pub async fn convert_and_post(&mut self) -> Result<(), FaxError> {
         // Guard against double-processing: if we've already posted (Complete) or failed,
         // another caller (e.g., CallEnded racing with T.38 completion) already handled it.
         // Note: FaxState::Received is NOT skipped — that's the normal entry state.
@@ -364,11 +367,12 @@ impl FaxSession {
                     .write_to(&mut Cursor::new(&mut buf), output_format.image_format())
                     .map(|_| buf)
             })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| FaxError::Tiff(format!("image encode: {e}")))?;
 
         if image_pages.is_empty() {
             self.post_failure("No pages in received fax").await;
-            anyhow::bail!("No pages in received fax");
+            return Err(FaxError::NoPages);
         }
 
         let page_count = image_pages.len() as u32;

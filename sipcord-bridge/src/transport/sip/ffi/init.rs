@@ -5,7 +5,7 @@
 //! - TLS transport creation and hot-reload
 //! - Shutdown and thread registration
 
-use super::super::audio_thread::stop_audio_thread;
+use crate::transport::sip::audio_thread::stop_audio_thread;
 use std::fmt;
 
 /// SIP invite session state (Rust wrapper for pjsip_inv_state)
@@ -50,22 +50,23 @@ impl fmt::Display for InvState {
         }
     }
 }
-use super::super::callbacks::{
+use crate::transport::sip::callbacks::{
     on_call_media_state_cb, on_call_rx_reinvite_cb, on_call_state_cb, on_dtmf_digit_cb,
     on_incoming_call_cb,
 };
-use super::super::nat::{
+use crate::transport::sip::nat::{
     on_rx_request_nat_fixup_cb, on_rx_response_nat_fixup_cb, on_tx_request_cb, on_tx_response_cb,
 };
-use super::super::register_handler::on_rx_request_cb;
+use crate::transport::sip::error::SipInitError;
+use crate::transport::sip::register_handler::on_rx_request_cb;
+use super::pj_str;
 use super::types::*;
 use crate::config::{SipConfig, TlsConfig};
-use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::collections::BTreeMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::net::IpAddr;
 use std::os::raw::{c_char, c_int};
@@ -170,7 +171,7 @@ fn extract_packet_source(msg: &str) -> Option<&str> {
     let space = rest.find(' ')?;
     let after_transport = &rest[space + 1..];
     let end = after_transport
-        .find(|c: char| c == ' ' || c == '\t')
+        .find([' ', '\t'])
         .unwrap_or(after_transport.len());
     Some(&after_transport[..end])
 }
@@ -312,7 +313,10 @@ pub fn set_callbacks(handlers: CallbackHandlers) {
 }
 
 /// Initialize pjsua with optional TLS support
-pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<()> {
+pub fn init_pjsua(
+    config: &SipConfig,
+    tls_config: Option<&TlsConfig>,
+) -> Result<(), SipInitError> {
     // Initialize public host config for Contact header rewriting on outgoing responses.
     // pjsua derives Contact from the TCP connection's local address (private IP), but
     // external clients need the public hostname to route BYE back to us.
@@ -352,7 +356,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         // Create pjsua instance
         let status = pjsua_create();
         if status != pj_constants__PJ_SUCCESS as i32 {
-            anyhow::bail!("Failed to create pjsua: {}", status);
+            return Err(SipInitError::Pjsua {
+                operation: "pjsua_create",
+                status,
+            });
         }
 
         // Disable automatic UDP->TCP switch for large SIP messages.
@@ -421,7 +428,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         // Initialize pjsua
         let status = pjsua_init(cfg_ptr, log_cfg_ptr, media_cfg_ptr);
         if status != pj_constants__PJ_SUCCESS as i32 {
-            anyhow::bail!("Failed to init pjsua: {}", status);
+            return Err(SipInitError::Pjsua {
+                operation: "pjsua_init",
+                status,
+            });
         }
 
         // Create UDP transport
@@ -432,7 +442,12 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
 
         // Set public address if specified - keep CString alive until transport is created
         let public_host_cstring = if !config.public_host.is_empty() {
-            let host = CString::new(config.public_host.as_str()).context("Invalid public host")?;
+            let host = CString::new(config.public_host.as_str()).map_err(|source| {
+                SipInitError::InvalidString {
+                    field: "public_host",
+                    source,
+                }
+            })?;
             t_cfg_ptr.public_addr = pj_str(host.as_ptr() as *mut c_char);
             Some(host)
         } else {
@@ -450,7 +465,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         drop(public_host_cstring);
 
         if status != pj_constants__PJ_SUCCESS as i32 {
-            anyhow::bail!("Failed to create UDP transport: {}", status);
+            return Err(SipInitError::TransportCreate {
+                kind: "UDP",
+                status,
+            });
         }
 
         // Create TCP transport on the same port
@@ -461,8 +479,12 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
 
         // Set public address for TCP - keep CString alive
         let tcp_public_host_cstring = if !config.public_host.is_empty() {
-            let host =
-                CString::new(config.public_host.as_str()).context("Invalid public host for TCP")?;
+            let host = CString::new(config.public_host.as_str()).map_err(|source| {
+                SipInitError::InvalidString {
+                    field: "public_host (TCP)",
+                    source,
+                }
+            })?;
             tcp_cfg_ptr.public_addr = pj_str(host.as_ptr() as *mut c_char);
             Some(host)
         } else {
@@ -479,7 +501,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         drop(tcp_public_host_cstring);
 
         if status != pj_constants__PJ_SUCCESS as i32 {
-            anyhow::bail!("Failed to create TCP transport: {}", status);
+            return Err(SipInitError::TransportCreate {
+                kind: "TCP",
+                status,
+            });
         }
 
         tracing::info!("TCP transport created on port {}", config.port);
@@ -494,7 +519,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         // Start pjsua
         let status = pjsua_start();
         if status != pj_constants__PJ_SUCCESS as i32 {
-            anyhow::bail!("Failed to start pjsua: {}", status);
+            return Err(SipInitError::Pjsua {
+                operation: "pjsua_start",
+                status,
+            });
         }
 
         // Configure codec priorities to keep INVITE SDP small.
@@ -507,27 +535,27 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         // ordered by quality (highest priority = preferred in SDP negotiation).
         {
             // Disable all audio codecs first
-            let all = CString::new("*").unwrap();
-            pjsua_codec_set_priority(&pj_str(all.as_ptr() as *mut c_char), 0);
+            pjsua_codec_set_priority(&pj_str::pj_str_from_cstr(c"*"), 0);
 
             // Re-enable desired codecs (highest priority = preferred in negotiation).
             // NOTE: G722 is registered internally at 16000Hz in PJSIP despite the
             // RFC 3551 SDP convention of advertising clock_rate=8000.
-            let codecs: &[(&str, u8)] = &[
-                ("opus/48000", 255),      // Best quality: adaptive, wideband/fullband
-                ("G722/16000", 254),      // Wideband 16kHz, widely supported
-                ("AMR/8000", 252),        // Adaptive narrowband
-                ("PCMU/8000", 200),       // G.711 mu-law, ubiquitous fallback
-                ("PCMA/8000", 199),       // G.711 A-law, ubiquitous fallback
-                ("telephone-event", 200), // DTMF support (all sample rates)
+            // Codec IDs are static — use &CStr literals so neither CString allocation
+            // nor an NUL check is needed.
+            let codecs: &[(&CStr, u8)] = &[
+                (c"opus/48000", 255),      // Best quality: adaptive, wideband/fullband
+                (c"G722/16000", 254),      // Wideband 16kHz, widely supported
+                (c"AMR/8000", 252),        // Adaptive narrowband
+                (c"PCMU/8000", 200),       // G.711 mu-law, ubiquitous fallback
+                (c"PCMA/8000", 199),       // G.711 A-law, ubiquitous fallback
+                (c"telephone-event", 200), // DTMF support (all sample rates)
             ];
 
             for (name, priority) in codecs {
-                let codec_id = CString::new(*name).unwrap();
                 let status =
-                    pjsua_codec_set_priority(&pj_str(codec_id.as_ptr() as *mut c_char), *priority);
+                    pjsua_codec_set_priority(&pj_str::pj_str_from_cstr(name), *priority);
                 if status != pj_constants__PJ_SUCCESS as i32 {
-                    tracing::warn!("Failed to set codec priority for {}: {}", name, status);
+                    tracing::warn!("Failed to set codec priority for {:?}: {}", name, status);
                 }
             }
 
@@ -535,7 +563,7 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
                 "Codec priorities configured: {}",
                 codecs
                     .iter()
-                    .map(|(n, p)| format!("{}={}", n, p))
+                    .map(|(n, p)| format!("{}={}", n.to_string_lossy(), p))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -579,7 +607,7 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
                 tracing::info!("Registered REGISTER handler module");
                 // Store the module pointer so register_handler can create
                 // UAS transactions for deferred REGISTER responses.
-                super::super::register_handler::set_register_module_ptr(&raw mut REGISTER_MODULE);
+                crate::transport::sip::register_handler::set_register_module_ptr(&raw mut REGISTER_MODULE);
             }
         } else {
             tracing::warn!("Could not get PJSIP endpoint for module registration");
@@ -633,7 +661,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         // This allows us to manually control audio I/O
         let master_port = pjsua_set_no_snd_dev();
         if master_port.is_null() {
-            anyhow::bail!("Failed to set null sound device");
+            return Err(SipInitError::Pjsua {
+                operation: "pjsua_set_no_snd_dev",
+                status: -1, // pjsua returned null pointer rather than a status code
+            });
         }
 
         // Verify the master port's actual sample rate
@@ -682,8 +713,12 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         let acc_cfg_ptr = acc_cfg.assume_init_mut();
 
         // Local account ID - keep CString alive until account is added
-        let local_uri = CString::new(format!("sip:sipcord@{}", config.public_host))
-            .context("Invalid local URI")?;
+        let local_uri = CString::new(format!("sip:sipcord@{}", config.public_host)).map_err(
+            |source| SipInitError::InvalidString {
+                field: "local account URI",
+                source,
+            },
+        )?;
         acc_cfg_ptr.id = pj_str(local_uri.as_ptr() as *mut c_char);
 
         // Enable incoming calls without registration
@@ -710,7 +745,12 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         // Set public IP for RTP if configured - this is advertised in SDP c= line
         // Without this, pjsua uses the local interface IP which won't work for NAT
         let rtp_public_ip_cstring = if let Some(ref public_ip) = config.rtp_public_ip {
-            let ip_cstr = CString::new(public_ip.as_str()).context("Invalid RTP public IP")?;
+            let ip_cstr = CString::new(public_ip.as_str()).map_err(|source| {
+                SipInitError::InvalidString {
+                    field: "rtp_public_ip",
+                    source,
+                }
+            })?;
             acc_cfg_ptr.rtp_cfg.public_addr = pj_str(ip_cstr.as_ptr() as *mut c_char);
             tracing::info!(
                 "Account RTP config: port={}, port_range={} (ports {}-{}), public_addr={}",
@@ -743,7 +783,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
         drop(rtp_public_ip_cstring);
 
         if status != pj_constants__PJ_SUCCESS as i32 {
-            anyhow::bail!("Failed to add account: {}", status);
+            return Err(SipInitError::Pjsua {
+                operation: "pjsua_acc_add",
+                status,
+            });
         }
 
         Ok(())
@@ -752,7 +795,10 @@ pub fn init_pjsua(config: &SipConfig, tls_config: Option<&TlsConfig>) -> Result<
 
 /// Create TLS transport for SIP-over-TLS
 /// Returns Ok(true) if created, Ok(false) if skipped due to missing certs
-fn create_tls_transport(tls_config: &TlsConfig, public_host: &str) -> Result<bool> {
+fn create_tls_transport(
+    tls_config: &TlsConfig,
+    public_host: &str,
+) -> Result<bool, SipInitError> {
     // Check cert files exist before doing anything
     let cert_path = tls_config.cert_path();
     let key_path = tls_config.key_path();
@@ -784,13 +830,29 @@ fn create_tls_transport(tls_config: &TlsConfig, public_host: &str) -> Result<boo
         t_cfg_ptr.port = tls_config.port as u32;
 
         // Set public address
-        let public_host_cstring = CString::new(public_host).context("Invalid public host")?;
+        let public_host_cstring =
+            CString::new(public_host).map_err(|source| SipInitError::InvalidString {
+                field: "TLS public_host",
+                source,
+            })?;
         t_cfg_ptr.public_addr = pj_str(public_host_cstring.as_ptr() as *mut c_char);
 
+        let cert_path_str = cert_path.to_str().ok_or(SipInitError::NonUtf8Path {
+            field: "TLS cert",
+        })?;
+        let key_path_str = key_path.to_str().ok_or(SipInitError::NonUtf8Path {
+            field: "TLS key",
+        })?;
         let cert_path_cstring =
-            CString::new(cert_path.to_str().unwrap()).context("Invalid cert path")?;
+            CString::new(cert_path_str).map_err(|source| SipInitError::InvalidString {
+                field: "TLS cert path",
+                source,
+            })?;
         let key_path_cstring =
-            CString::new(key_path.to_str().unwrap()).context("Invalid key path")?;
+            CString::new(key_path_str).map_err(|source| SipInitError::InvalidString {
+                field: "TLS key path",
+                source,
+            })?;
 
         // Set certificate and key
         t_cfg_ptr.tls_setting.cert_file = pj_str(cert_path_cstring.as_ptr() as *mut c_char);
@@ -813,7 +875,10 @@ fn create_tls_transport(tls_config: &TlsConfig, public_host: &str) -> Result<boo
         drop(key_path_cstring);
 
         if status != pj_constants__PJ_SUCCESS as i32 {
-            anyhow::bail!("Failed to create TLS transport: {}", status);
+            return Err(SipInitError::TransportCreate {
+                kind: "TLS",
+                status,
+            });
         }
 
         // Store transport ID for potential reload
@@ -834,7 +899,10 @@ fn create_tls_transport(tls_config: &TlsConfig, public_host: &str) -> Result<boo
 ///
 /// This should only be called when there are no active calls.
 /// Returns Ok(true) if reload/create was successful, Ok(false) if skipped (certs missing or calls active).
-pub fn reload_tls_transport(tls_config: &TlsConfig, public_host: &str) -> Result<bool> {
+pub fn reload_tls_transport(
+    tls_config: &TlsConfig,
+    public_host: &str,
+) -> Result<bool, SipInitError> {
     // Check active calls - don't reload if calls are active
     let active_calls = COUNTED_CALL_IDS
         .get()
@@ -899,7 +967,7 @@ pub fn active_media_call_count() -> usize {
 }
 
 /// Process pjsua events (call from event loop)
-pub fn process_pjsua_events(timeout_ms: u32) -> Result<()> {
+pub fn process_pjsua_events(timeout_ms: u32) -> Result<(), SipInitError> {
     unsafe {
         pj_thread_sleep(timeout_ms);
     }
@@ -968,10 +1036,7 @@ pub fn send_183_session_progress(call_id: CallId) {
             );
         }
 
-        // Create reason string
-        let reason = CString::new("Session Progress").unwrap();
-        let reason_pj = pj_str(reason.as_ptr() as *mut c_char);
-
+        let reason_pj = pj_str::pj_str_from_cstr(c"Session Progress");
         let status = pjsua_call_answer(*call_id, 183, &reason_pj, ptr::null());
         if status != pj_constants__PJ_SUCCESS as i32 {
             tracing::warn!("Failed to send 183 for call {}: status={}", call_id, status);

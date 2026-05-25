@@ -19,7 +19,7 @@
 
 use super::types::*;
 use crate::services::sound::StreamingPlayer;
-use anyhow::Result;
+use crate::transport::sip::error::SipAudioError;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::collections::HashMap;
@@ -152,19 +152,16 @@ pub fn start_streaming_to_call(
     call_id: CallId,
     path: &Path,
     hangup_on_complete: bool,
-) -> Result<()> {
+) -> Result<(), SipAudioError> {
     use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
-    // Create the streaming player
     let player = StreamingPlayer::new(path)?;
 
     // Get call's conference port
     let call_conf_port = CALL_CONF_PORTS
         .get()
         .and_then(|p| p.get(&call_id).map(|r| *r))
-        .ok_or_else(|| {
-            anyhow::anyhow!("No conf_port for call {} - media not ready yet", call_id)
-        })?;
+        .ok_or(SipAudioError::NoConfPort { call_id })?;
 
     let guard = unsafe {
         let callbacks = PortCallbacks {

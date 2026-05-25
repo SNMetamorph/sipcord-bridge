@@ -8,16 +8,51 @@
 
 mod streaming;
 
-use crate::audio::{flac, wav};
+use crate::audio::{AudioParseError, flac, wav};
 use crate::config::{AppConfig, SoundEntry};
 use crate::transport::sip::CONF_SAMPLE_RATE;
-use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-pub use streaming::StreamingPlayer;
+pub use streaming::{StreamingError, StreamingPlayer};
+
+/// Errors raised by sound loading and parsing.
+#[derive(thiserror::Error, Debug)]
+pub enum SoundError {
+    /// Failed to read the sound file from disk.
+    #[error("failed to read sound file {path:?}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Parse failure from the WAV/FLAC decoder.
+    #[error("failed to parse audio for {name}: {source}")]
+    Parse {
+        name: String,
+        #[source]
+        source: AudioParseError,
+    },
+
+    /// Sound's sample rate didn't match the bridge's configured rate.
+    #[error("sound {name} has wrong sample rate: {got} Hz (expected {expected} Hz)")]
+    WrongSampleRate {
+        name: String,
+        got: u32,
+        expected: u32,
+    },
+
+    /// File header doesn't match any supported format (WAV / FLAC).
+    #[error("unknown audio format for {name}: header bytes {header:02x?}")]
+    UnknownFormat { name: String, header: Vec<u8> },
+
+    /// Streaming player setup failure.
+    #[error(transparent)]
+    Streaming(#[from] StreamingError),
+}
 
 /// A preloaded sound ready for immediate playback
 #[derive(Debug, Clone)]
@@ -49,7 +84,7 @@ pub struct SoundManager {
 
 impl SoundManager {
     /// Create a new SoundManager and load sounds from config
-    pub fn new(sounds_dir: PathBuf) -> Result<Self> {
+    pub fn new(sounds_dir: PathBuf) -> Result<Self, SoundError> {
         let config = AppConfig::global();
         let mut manager = Self {
             preloaded: HashMap::new(),
@@ -63,7 +98,7 @@ impl SoundManager {
     }
 
     /// Load all sounds from config entries
-    fn load_sounds(&mut self, entries: &HashMap<String, SoundEntry>) -> Result<()> {
+    fn load_sounds(&mut self, entries: &HashMap<String, SoundEntry>) -> Result<(), SoundError> {
         let mut preloaded_count = 0;
         let mut streaming_count = 0;
         let mut virtual_count = 0;
@@ -135,9 +170,15 @@ impl SoundManager {
     }
 
     /// Load a preloaded sound from a file
-    fn load_preloaded_sound(&self, path: &Path, name: &str) -> Result<PreloadedSound> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("Failed to read sound file: {}", path.display()))?;
+    fn load_preloaded_sound(
+        &self,
+        path: &Path,
+        name: &str,
+    ) -> Result<PreloadedSound, SoundError> {
+        let data = std::fs::read(path).map_err(|source| SoundError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
         let samples = self.parse_audio(&data, name)?;
 
@@ -149,21 +190,22 @@ impl SoundManager {
         })
     }
 
-    /// Parse audio data (auto-detect WAV or FLAC format)
-    /// Expects 16kHz mono - panics if wrong sample rate
-    fn parse_audio(&self, data: &[u8], name: &str) -> Result<Vec<i16>> {
+    /// Parse audio data (auto-detect WAV or FLAC format).
+    /// Expects 16kHz mono — returns `WrongSampleRate` otherwise.
+    fn parse_audio(&self, data: &[u8], name: &str) -> Result<Vec<i16>, SoundError> {
         // Check for FLAC magic number: "fLaC"
         if data.len() >= 4 && &data[0..4] == b"fLaC" {
             debug!("Detected FLAC format for '{}'", name);
-            let (samples, rate) = flac::parse_flac(data)
-                .with_context(|| format!("Failed to parse FLAC for sound '{}'", name))?;
+            let (samples, rate) = flac::parse_flac(data).map_err(|source| SoundError::Parse {
+                name: name.to_string(),
+                source,
+            })?;
             if rate != CONF_SAMPLE_RATE {
-                anyhow::bail!(
-                    "Sound '{}' has wrong sample rate: {} Hz (expected {} Hz). Pre-resample the file.",
-                    name,
-                    rate,
-                    CONF_SAMPLE_RATE
-                );
+                return Err(SoundError::WrongSampleRate {
+                    name: name.to_string(),
+                    got: rate,
+                    expected: CONF_SAMPLE_RATE,
+                });
             }
             return Ok(samples);
         }
@@ -171,24 +213,24 @@ impl SoundManager {
         // Check for WAV magic number: "RIFF"
         if data.len() >= 4 && &data[0..4] == b"RIFF" {
             debug!("Detected WAV format for '{}'", name);
-            let (samples, rate) = wav::parse_wav(data)
-                .with_context(|| format!("Failed to parse WAV for sound '{}'", name))?;
+            let (samples, rate) = wav::parse_wav(data).map_err(|source| SoundError::Parse {
+                name: name.to_string(),
+                source,
+            })?;
             if rate != CONF_SAMPLE_RATE {
-                anyhow::bail!(
-                    "Sound '{}' has wrong sample rate: {} Hz (expected {} Hz). Pre-resample the file.",
-                    name,
-                    rate,
-                    CONF_SAMPLE_RATE
-                );
+                return Err(SoundError::WrongSampleRate {
+                    name: name.to_string(),
+                    got: rate,
+                    expected: CONF_SAMPLE_RATE,
+                });
             }
             return Ok(samples);
         }
 
-        anyhow::bail!(
-            "Unknown audio format for '{}': header bytes {:?}",
-            name,
-            &data[..4.min(data.len())]
-        )
+        Err(SoundError::UnknownFormat {
+            name: name.to_string(),
+            header: data[..4.min(data.len())].to_vec(),
+        })
     }
 
     /// Get a preloaded sound by name
@@ -235,6 +277,6 @@ impl SoundManager {
 }
 
 /// Create an Arc-wrapped SoundManager for sharing across async tasks
-pub fn create_sound_manager(sounds_dir: PathBuf) -> Result<Arc<SoundManager>> {
+pub fn create_sound_manager(sounds_dir: PathBuf) -> Result<Arc<SoundManager>, SoundError> {
     Ok(Arc::new(SoundManager::new(sounds_dir)?))
 }

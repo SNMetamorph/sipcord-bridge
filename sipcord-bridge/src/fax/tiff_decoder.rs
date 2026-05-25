@@ -6,11 +6,19 @@
 //! Huffman table data derived from the ITU-T T.4 standard.
 //! Bit-reading approach inspired by the `fax` crate (MIT licensed).
 
-use anyhow::{Result, bail};
+use super::FaxError;
 use image::GrayImage;
 use std::path::Path;
 use std::sync::OnceLock;
 use tracing::debug;
+
+/// Convenience: most failures in this module are malformed-TIFF conditions
+/// that map cleanly onto `FaxError::Tiff(String)`.
+macro_rules! tiff_bail {
+    ($($arg:tt)*) => {
+        return Err(FaxError::Tiff(format!($($arg)*)))
+    };
+}
 
 // Public API
 
@@ -19,19 +27,27 @@ use tracing::debug;
 const MAX_TIFF_SIZE: u64 = 50 * 1024 * 1024;
 
 /// Decode all pages of a fax TIFF file into grayscale images.
-pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>> {
+pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
     if !path.exists() {
-        bail!("TIFF file not found: {}", path.display());
+        tiff_bail!("TIFF file not found: {}", path.display());
     }
-    let file_size = std::fs::metadata(path)?.len();
+    let file_size = std::fs::metadata(path)
+        .map_err(|source| FaxError::Io {
+            context: format!("metadata({})", path.display()),
+            source,
+        })?
+        .len();
     if file_size > MAX_TIFF_SIZE {
-        bail!(
+        tiff_bail!(
             "TIFF file too large: {} bytes (max {} bytes)",
             file_size,
             MAX_TIFF_SIZE
         );
     }
-    let data = std::fs::read(path)?;
+    let data = std::fs::read(path).map_err(|source| FaxError::Io {
+        context: format!("read({})", path.display()),
+        source,
+    })?;
     let pages = parse_tiff_ifds(&data)?;
     let mut images = Vec::with_capacity(pages.len());
 
@@ -51,7 +67,7 @@ pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>> {
             let start = *off as usize;
             let end = start + *len as usize;
             if end > data.len() {
-                bail!(
+                tiff_bail!(
                     "TIFF strip extends past file: offset={}, count={}, file_len={}",
                     off,
                     len,
@@ -71,7 +87,7 @@ pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>> {
         let transitions_per_line = match page.compression {
             3 => decode_group3(&strip_data, page.width, page.height, page.t4_options)?,
             4 => decode_group4(&strip_data, page.width, page.height)?,
-            other => bail!("Unsupported TIFF compression: {}", other),
+            other => tiff_bail!("Unsupported TIFF compression: {}", other),
         };
 
         let img = assemble_image(
@@ -104,18 +120,18 @@ struct TiffPage {
     y_resolution: Option<(u32, u32)>, // numerator, denominator (RATIONAL)
 }
 
-fn parse_tiff_ifds(data: &[u8]) -> Result<Vec<TiffPage>> {
+fn parse_tiff_ifds(data: &[u8]) -> Result<Vec<TiffPage>, FaxError> {
     if data.len() < 8 {
-        bail!("TIFF file too short");
+        tiff_bail!("TIFF file too short");
     }
     let le = match (data[0], data[1]) {
         (0x49, 0x49) => true,
         (0x4D, 0x4D) => false,
-        _ => bail!("Not a TIFF file"),
+        _ => tiff_bail!("Not a TIFF file"),
     };
     let magic = read_u16(data, 2, le);
     if magic != 42 {
-        bail!("Bad TIFF magic: {}", magic);
+        tiff_bail!("Bad TIFF magic: {}", magic);
     }
 
     let mut ifd_offset = read_u32(data, 4, le) as usize;
@@ -184,7 +200,7 @@ fn parse_tiff_ifds(data: &[u8]) -> Result<Vec<TiffPage>> {
     }
 
     if pages.is_empty() {
-        bail!("No IFDs found in TIFF");
+        tiff_bail!("No IFDs found in TIFF");
     }
     Ok(pages)
 }
@@ -830,7 +846,12 @@ fn decode_line_2d(reader: &mut BitReader, reference: &[u16], width: u16) -> Opti
 
 // Group 3 Image Driver
 
-fn decode_group3(data: &[u8], width: u32, height: u32, t4_options: u32) -> Result<Vec<Vec<u16>>> {
+fn decode_group3(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    t4_options: u32,
+) -> Result<Vec<Vec<u16>>, FaxError> {
     let w = width as u16;
     let is_2d = (t4_options & 1) != 0;
     let has_fill_bits = (t4_options & 4) != 0;
@@ -840,7 +861,7 @@ fn decode_group3(data: &[u8], width: u32, height: u32, t4_options: u32) -> Resul
 
     // Scan for the first EOL
     if !reader.scan_for_eol() {
-        bail!("No EOL found at start of Group 3 data");
+        tiff_bail!("No EOL found at start of Group 3 data");
     }
 
     for _ in 0..height {
@@ -926,14 +947,14 @@ fn decode_group3(data: &[u8], width: u32, height: u32, t4_options: u32) -> Resul
     }
 
     if lines.is_empty() {
-        bail!("Group 3 decoder produced no lines");
+        tiff_bail!("Group 3 decoder produced no lines");
     }
     Ok(lines)
 }
 
 // Group 4 Image Driver
 
-fn decode_group4(data: &[u8], width: u32, height: u32) -> Result<Vec<Vec<u16>>> {
+fn decode_group4(data: &[u8], width: u32, height: u32) -> Result<Vec<Vec<u16>>, FaxError> {
     let w = width as u16;
     let mut reader = BitReader::new(data);
     let mut lines: Vec<Vec<u16>> = Vec::with_capacity(height as usize);
@@ -958,7 +979,7 @@ fn decode_group4(data: &[u8], width: u32, height: u32) -> Result<Vec<Vec<u16>>> 
     }
 
     if lines.is_empty() {
-        bail!("Group 4 decoder produced no lines");
+        tiff_bail!("Group 4 decoder produced no lines");
     }
     Ok(lines)
 }

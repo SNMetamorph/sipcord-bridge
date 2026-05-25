@@ -5,7 +5,7 @@
 
 use super::streaming_player::STREAMING_PLAYER_POOL;
 use super::types::*;
-use anyhow::Result;
+use crate::transport::sip::error::SipAudioError;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::collections::HashMap;
@@ -129,16 +129,14 @@ pub unsafe extern "C" fn test_tone_on_destroy(this_port: *mut pjmedia_port) -> p
 /// Start playing a 440Hz test tone to a call
 ///
 /// The tone plays indefinitely until the caller hangs up. No automatic hangup.
-pub fn start_test_tone_to_call(call_id: CallId) -> Result<()> {
+pub fn start_test_tone_to_call(call_id: CallId) -> Result<(), SipAudioError> {
     use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
     // Get call's conference port
     let call_conf_port = CALL_CONF_PORTS
         .get()
         .and_then(|p| p.get(&call_id).map(|r| *r))
-        .ok_or_else(|| {
-            anyhow::anyhow!("No conf_port for call {} - media not ready yet", call_id)
-        })?;
+        .ok_or(SipAudioError::NoConfPort { call_id })?;
 
     let guard = unsafe {
         let callbacks = PortCallbacks {

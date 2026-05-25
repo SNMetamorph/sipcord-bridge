@@ -19,6 +19,7 @@ pub(super) mod direct_player;
 pub(crate) mod frame_utils;
 pub(super) mod init;
 pub(super) mod looping_player;
+pub(super) mod pj_str;
 pub(super) mod streaming_player;
 pub(super) mod test_tone;
 pub mod types;

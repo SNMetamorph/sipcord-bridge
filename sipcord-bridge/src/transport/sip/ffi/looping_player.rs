@@ -4,7 +4,7 @@
 //! Used for the "connecting" sound during call setup (183 Session Progress).
 
 use super::types::*;
-use anyhow::Result;
+use crate::transport::sip::error::SipAudioError;
 use parking_lot::Mutex;
 use pjsua::*;
 use std::collections::HashMap;
@@ -118,7 +118,7 @@ pub unsafe extern "C" fn looping_player_on_destroy(this_port: *mut pjmedia_port)
 ///
 /// Creates a pjmedia_port that loops the given samples and connects it to the call.
 /// The loop continues until stop_loop is called.
-pub fn start_loop(call_id: CallId, samples: Vec<i16>) -> Result<()> {
+pub fn start_loop(call_id: CallId, samples: Vec<i16>) -> Result<(), SipAudioError> {
     use super::frame_utils::{PortCallbacks, create_and_connect_port};
 
     // Check if already looping for this call
@@ -134,9 +134,7 @@ pub fn start_loop(call_id: CallId, samples: Vec<i16>) -> Result<()> {
     let call_conf_port = CALL_CONF_PORTS
         .get()
         .and_then(|p| p.get(&call_id).map(|r| *r))
-        .ok_or_else(|| {
-            anyhow::anyhow!("No conf_port for call {} - media not ready yet", call_id)
-        })?;
+        .ok_or(SipAudioError::NoConfPort { call_id })?;
 
     let guard = unsafe {
         let callbacks = PortCallbacks {

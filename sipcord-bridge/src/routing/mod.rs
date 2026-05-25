@@ -41,12 +41,17 @@ pub enum RouteDecision {
 }
 
 /// Errors that trigger audio playback before hangup
-#[derive(Debug, Clone, Copy)]
+#[derive(thiserror::Error, Debug, Clone, Copy)]
 pub enum CallError {
+    #[error("no channel mapping for the dialed extension")]
     NoChannelMapping,
+    #[error("user lacks permission for the target Discord channel")]
     NoPermissions,
+    #[error("Discord API error")]
     DiscordApiError,
+    #[error("server is busy")]
     ServerBusy,
+    #[error("unknown call error")]
     Unknown,
 }
 

@@ -169,6 +169,18 @@ impl Registrar {
     }
 }
 
+/// Start the periodic cleanup task
+pub fn spawn_cleanup_task(registrar: Arc<Registrar>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            registrar.remove_expired();
+            debug!("Registrar cleanup complete");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,16 +324,4 @@ mod tests {
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].0, "sip:charlie@5.6.7.8");
     }
-}
-
-/// Start the periodic cleanup task
-pub fn spawn_cleanup_task(registrar: Arc<Registrar>) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            registrar.remove_expired();
-            debug!("Registrar cleanup complete");
-        }
-    });
 }

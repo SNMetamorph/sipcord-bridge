@@ -7,12 +7,13 @@
 use super::callbacks::{
     extract_digest_auth_from_rdata, extract_source_ip, extract_user_agent, is_sipvicious_scanner,
 };
+use super::error::SipResponseError;
+use super::ffi::pj_str::respond_stateless_with_headers;
 use super::ffi::types::*;
 use super::ffi::utils::pj_str_to_string;
 use pjsua::*;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::net::SocketAddr;
-use std::os::raw::c_char;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -74,69 +75,19 @@ pub fn set_register_module_ptr(ptr: *mut pjsip_module) {
 
 // Helpers
 
-/// Initialize a pjsip_hdr as a list head (equivalent to pj_list_init C macro).
-#[inline]
-unsafe fn pj_list_init_hdr(hdr: *mut pjsip_hdr) {
+/// Send a stateless SIP response with a status code and reason phrase but no
+/// extra headers. Logs (and otherwise swallows) any pjsip failure — these
+/// responses are best-effort from inside an FFI callback.
+unsafe fn send_simple_response(rdata: *mut pjsip_rx_data, status_code: u16, reason: &CStr) {
     unsafe {
-        (*hdr).next = hdr as *mut _;
-        (*hdr).prev = hdr as *mut _;
-    }
-}
-
-/// Create a generic string header in `pool`. Returns null on failure (alloc or
-/// interior-NUL in `value`). pjsip duplicates name/value into `pool`, so the
-/// caller's CStrings can be dropped immediately after this returns.
-#[inline]
-unsafe fn make_string_hdr(
-    pool: *mut pj_pool_t,
-    name: &CStr,
-    value: &str,
-) -> *mut pjsip_generic_string_hdr {
-    unsafe {
-        let Ok(value_c) = CString::new(value) else {
-            return ptr::null_mut();
-        };
-        let name_pj = pj_str(name.as_ptr() as *mut c_char);
-        let value_pj = pj_str(value_c.as_ptr() as *mut c_char);
-        pjsip_generic_string_hdr_create(pool, &name_pj, &value_pj)
-    }
-}
-
-/// Append a generic string header onto the message buffer in `tdata`,
-/// allocating from the tdata's own pool. Returns false on failure.
-#[inline]
-pub(super) unsafe fn append_tdata_hdr(
-    tdata: *mut pjsip_tx_data,
-    name: &CStr,
-    value: &str,
-) -> bool {
-    unsafe {
-        let hdr = make_string_hdr((*tdata).pool, name, value);
-        if hdr.is_null() {
-            return false;
-        }
-        pj_list_insert_before(
-            &mut (*(*tdata).msg).hdr as *mut pjsip_hdr as *mut pj_list_type,
-            hdr as *mut pj_list_type,
-        );
-        true
-    }
-}
-
-/// Send a simple stateless SIP response (no custom headers).
-unsafe fn send_simple_response(rdata: *mut pjsip_rx_data, status_code: u16, reason: &str) {
-    unsafe {
-        let endpt = pjsua_get_pjsip_endpt();
-        if !endpt.is_null() {
-            let reason_cstr = CString::new(reason).unwrap();
-            let reason_pj = pj_str(reason_cstr.as_ptr() as *mut c_char);
-            pjsip_endpt_respond_stateless(
-                endpt,
-                rdata,
-                status_code.into(),
-                &reason_pj,
-                ptr::null(),
-                ptr::null(),
+        if let Err(e) =
+            respond_stateless_with_headers(rdata, status_code, Some(reason), &[])
+        {
+            tracing::warn!(
+                "Failed to respond {} {:?} to SIP request: {}",
+                status_code,
+                reason,
+                e
             );
         }
     }
@@ -148,67 +99,30 @@ unsafe fn send_simple_response(rdata: *mut pjsip_rx_data, status_code: u16, reas
 /// client's current bindings via Contact header(s). Strict clients like 3CX
 /// interpret a Contact-less response as "forced unregister" and tear down the
 /// trunk even though the binding was accepted server-side.
-unsafe fn send_register_ok(rdata: *mut pjsip_rx_data, expires: u32, contact_uri: Option<&str>) {
+unsafe fn send_register_ok(
+    rdata: *mut pjsip_rx_data,
+    expires: u32,
+    contact_uri: Option<&str>,
+) -> Result<(), SipResponseError> {
     unsafe {
-        let endpt = pjsua_get_pjsip_endpt();
-        if endpt.is_null() {
-            return;
-        }
+        let expires_str = expires.to_string();
+        let contact_str = contact_uri.map(|uri| format!("<{}>;expires={}", uri, expires));
 
-        let pool = pjsua_pool_create(c"register_ok".as_ptr(), 1024, 1024);
-        if !pool.is_null() {
-            let exp_hdr = make_string_hdr(pool, c"Expires", &expires.to_string());
-            let contact_hdr = match contact_uri {
-                Some(uri) => make_string_hdr(
-                    pool,
-                    c"Contact",
-                    &format!("<{}>;expires={}", uri, expires),
-                ),
-                None => ptr::null_mut(),
-            };
-
-            if !exp_hdr.is_null() {
-                let hdr_list =
-                    pj_pool_alloc(pool, std::mem::size_of::<pjsip_hdr>()) as *mut pjsip_hdr;
-                if !hdr_list.is_null() {
-                    pj_list_init_hdr(hdr_list);
-                    pj_list_insert_before(
-                        hdr_list as *mut pj_list_type,
-                        exp_hdr as *mut pj_list_type,
-                    );
-                    if !contact_hdr.is_null() {
-                        pj_list_insert_before(
-                            hdr_list as *mut pj_list_type,
-                            contact_hdr as *mut pj_list_type,
-                        );
-                    }
-
-                    let status = pjsip_endpt_respond_stateless(
-                        endpt,
-                        rdata,
-                        200,
-                        ptr::null(),
-                        hdr_list,
-                        ptr::null(),
-                    );
-                    if status != pj_constants__PJ_SUCCESS as i32 {
-                        tracing::warn!("Failed to respond 200 OK to REGISTER: {}", status);
-                    }
-                    // Release pool — pjsip_endpt_respond_stateless clones what it
-                    // needs into rdata's pool, so our header pool can be freed now.
-                    pj_pool_release(pool);
-                    return;
-                }
-            }
-            // Header creation failed — release the pool before falling through
-            pj_pool_release(pool);
-        }
-
-        // Fallback: respond without extra headers
-        let status =
-            pjsip_endpt_respond_stateless(endpt, rdata, 200, ptr::null(), ptr::null(), ptr::null());
-        if status != pj_constants__PJ_SUCCESS as i32 {
-            tracing::warn!("Failed to respond 200 OK to REGISTER: {}", status);
+        // Two-header common case
+        if let Some(ref contact) = contact_str {
+            respond_stateless_with_headers(
+                rdata,
+                200,
+                None,
+                &[(c"Expires", expires_str.as_str()), (c"Contact", contact.as_str())],
+            )
+        } else {
+            respond_stateless_with_headers(
+                rdata,
+                200,
+                None,
+                &[(c"Expires", expires_str.as_str())],
+            )
         }
     }
 }
@@ -232,26 +146,27 @@ unsafe fn detect_transport(rdata: *mut pjsip_rx_data) -> crate::services::regist
 }
 
 /// Create a UAS transaction + pre-built response tdata for deferred REGISTER
-/// responses. Returns `None` if transaction creation fails (caller should fall
-/// back to stateless response).
+/// responses. Caller falls back to a stateless 200 if this errors.
 unsafe fn create_register_tsx(
     rdata: *mut pjsip_rx_data,
     expires: u32,
     contact_uri: Option<String>,
-) -> Option<PendingRegisterTsx> {
+) -> Result<PendingRegisterTsx, SipResponseError> {
     unsafe {
         let endpt = pjsua_get_pjsip_endpt();
+        if endpt.is_null() {
+            return Err(SipResponseError::EndpointNull);
+        }
         let module_ptr = REGISTER_MODULE_PTR.load(Ordering::Acquire);
-
-        if endpt.is_null() || module_ptr.is_null() {
-            return None;
+        if module_ptr.is_null() {
+            return Err(SipResponseError::EndpointNull);
         }
 
         // Create UAS transaction
         let mut tsx: *mut pjsip_transaction = ptr::null_mut();
         let status = pjsip_tsx_create_uas2(module_ptr, rdata, ptr::null_mut(), &mut tsx);
         if status != pj_constants__PJ_SUCCESS as i32 || tsx.is_null() {
-            return None;
+            return Err(SipResponseError::TsxCreate(status));
         }
 
         // Feed the request to the transaction (starts Timer F, stores headers)
@@ -263,10 +178,10 @@ unsafe fn create_register_tsx(
         let status = pjsip_endpt_create_response(endpt, rdata, 200, ptr::null(), &mut tdata);
         if status != pj_constants__PJ_SUCCESS as i32 || tdata.is_null() {
             pjsip_tsx_terminate(tsx, 500);
-            return None;
+            return Err(SipResponseError::ResponseBuild(status));
         }
 
-        Some(PendingRegisterTsx {
+        Ok(PendingRegisterTsx {
             tsx: SendableTsx(tsx),
             tdata: SendableTdata(tdata),
             expires,
@@ -326,7 +241,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
             let result = ban_mgr.check_banned(&ip);
             if result.is_banned {
                 tracing::debug!("Rejecting REGISTER from banned IP {}", ip);
-                send_simple_response(rdata, 403, "Forbidden");
+                send_simple_response(rdata, 403, c"Forbidden");
                 return pj_constants__PJ_TRUE as pj_bool_t;
             }
         }
@@ -355,7 +270,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                     user_agent
                 );
             }
-            send_simple_response(rdata, 403, "Forbidden");
+            send_simple_response(rdata, 403, c"Forbidden");
             return pj_constants__PJ_TRUE as pj_bool_t;
         }
 
@@ -367,7 +282,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
             && ban_mgr.record_register(ip)
         {
             tracing::debug!("Rejecting REGISTER from {} - rate limit exceeded", ip);
-            send_simple_response(rdata, 429, "Too Many Requests");
+            send_simple_response(rdata, 429, c"Too Many Requests");
             return pj_constants__PJ_TRUE as pj_bool_t;
         }
 
@@ -387,7 +302,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                     ip_str,
                     params.username
                 );
-                send_simple_response(rdata, 429, "Too Many Requests");
+                send_simple_response(rdata, 429, c"Too Many Requests");
                 return pj_constants__PJ_TRUE as pj_bool_t;
             }
 
@@ -408,7 +323,13 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                             params.username,
                             ip_str
                         );
-                        send_register_ok(rdata, expires, contact_uri.as_deref());
+                        if let Err(e) = send_register_ok(rdata, expires, contact_uri.as_deref()) {
+                            tracing::warn!(
+                                "REGISTER 200 OK (cached) send failed for {}: {} — strict clients may reject",
+                                params.username,
+                                e
+                            );
+                        }
                         // Send to async handler for registrar update
                         if let Some(tx) = REGISTER_EVENT_TX.get() {
                             let _ = tx.try_send(RegisterRequest {
@@ -429,7 +350,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                             params.username,
                             ip_str
                         );
-                        send_simple_response(rdata, 403, "Forbidden");
+                        send_simple_response(rdata, 403, c"Forbidden");
                         // Send to async so API can re-verify (cache may be stale
                         // after a password change) and update failure counts
                         if let Some(tx) = REGISTER_EVENT_TX.get() {
@@ -453,24 +374,29 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                             params.username,
                             ip_str
                         );
-                        if let Some(pending) = create_register_tsx(rdata, expires, contact_uri.clone()) {
-                            if let Some(tx) = REGISTER_EVENT_TX.get() {
-                                let _ = tx.try_send(RegisterRequest {
-                                    digest_auth: params,
-                                    contact_uri: contact_uri.unwrap_or_default(),
-                                    source_addr,
-                                    transport,
-                                    expires,
-                                    pending_tsx: Some(pending),
-                                });
+                        match create_register_tsx(rdata, expires, contact_uri.clone()) {
+                            Ok(pending) => {
+                                if let Some(tx) = REGISTER_EVENT_TX.get() {
+                                    let _ = tx.try_send(RegisterRequest {
+                                        digest_auth: params,
+                                        contact_uri: contact_uri.unwrap_or_default(),
+                                        source_addr,
+                                        transport,
+                                        expires,
+                                        pending_tsx: Some(pending),
+                                    });
+                                }
+                                return pj_constants__PJ_TRUE as pj_bool_t;
                             }
-                            return pj_constants__PJ_TRUE as pj_bool_t;
+                            Err(e) => {
+                                // Transaction creation failed — fall through to
+                                // stateless 200 OK below.
+                                tracing::warn!(
+                                    "Failed to create tsx for deferred REGISTER ({}), falling back to stateless 200",
+                                    e
+                                );
+                            }
                         }
-                        // Transaction creation failed — fall through to stateless
-                        // 200 OK below (same behaviour as before this change).
-                        tracing::warn!(
-                            "Failed to create tsx for deferred REGISTER, falling back to stateless 200"
-                        );
                     }
                 }
             }
@@ -483,6 +409,7 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                 params.username
             );
             let contact_uri_for_response = contact_uri.clone();
+            let user_for_log = params.username.clone();
             if let Some(tx) = REGISTER_EVENT_TX.get() {
                 let _ = tx.try_send(RegisterRequest {
                     digest_auth: params,
@@ -493,7 +420,14 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                     pending_tsx: None,
                 });
             }
-            send_register_ok(rdata, expires, contact_uri_for_response.as_deref());
+            if let Err(e) = send_register_ok(rdata, expires, contact_uri_for_response.as_deref())
+            {
+                tracing::warn!(
+                    "REGISTER 200 OK (stateless) send failed for {}: {} — strict clients may reject",
+                    user_for_log,
+                    e
+                );
+            }
         } else {
             // No Authorization header - send 401 challenge
             tracing::debug!(
@@ -501,63 +435,24 @@ pub unsafe extern "C" fn on_rx_request_cb(rdata: *mut pjsip_rx_data) -> pj_bool_
                 ip_str
             );
 
-            let endpt = pjsua_get_pjsip_endpt();
-            if endpt.is_null() {
-                tracing::error!("Failed to get PJSIP endpoint for REGISTER 401 response");
-                return pj_constants__PJ_TRUE as pj_bool_t;
-            }
-
             // Generate a cryptographically random nonce
-            let nonce = {
+            let nonce: String = {
                 let bytes: [u8; 16] = rand::random();
-                bytes
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>()
+                bytes.iter().map(|b| format!("{:02x}", b)).collect()
             };
-
             let www_auth = format!(
                 "Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
                 SIP_REALM, nonce
             );
 
-            // Create WWW-Authenticate header
-            let hdr_name = CString::new("WWW-Authenticate").unwrap();
-            let hdr_value = CString::new(www_auth).unwrap();
-
-            let pool = pjsua_pool_create(c"register_401".as_ptr(), 512, 512);
-            if pool.is_null() {
-                tracing::error!("Failed to create pool for REGISTER 401 response");
-                return pj_constants__PJ_TRUE as pj_bool_t;
+            if let Err(e) = respond_stateless_with_headers(
+                rdata,
+                401,
+                None,
+                &[(c"WWW-Authenticate", www_auth.as_str())],
+            ) {
+                tracing::warn!("Failed to send 401 challenge to REGISTER: {}", e);
             }
-
-            let name = pj_str(hdr_name.as_ptr() as *mut c_char);
-            let value = pj_str(hdr_value.as_ptr() as *mut c_char);
-            let hdr = pjsip_generic_string_hdr_create(pool, &name, &value);
-
-            if !hdr.is_null() {
-                let hdr_list =
-                    pj_pool_alloc(pool, std::mem::size_of::<pjsip_hdr>()) as *mut pjsip_hdr;
-                if !hdr_list.is_null() {
-                    pj_list_init_hdr(hdr_list);
-                    pj_list_insert_before(hdr_list as *mut pj_list_type, hdr as *mut pj_list_type);
-
-                    let status = pjsip_endpt_respond_stateless(
-                        endpt,
-                        rdata,
-                        401,
-                        ptr::null(),
-                        hdr_list,
-                        ptr::null(),
-                    );
-
-                    if status != pj_constants__PJ_SUCCESS as i32 {
-                        tracing::warn!("Failed to respond 401 to REGISTER: {}", status);
-                    }
-                }
-            }
-            // Release pool — pjsip_endpt_respond_stateless clones headers internally
-            pj_pool_release(pool);
         }
 
         // Return TRUE to indicate we handled this request

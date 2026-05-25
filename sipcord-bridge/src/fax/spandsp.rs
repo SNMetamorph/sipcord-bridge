@@ -3,7 +3,7 @@
 //! Uses the `spandsp` safe wrapper crate to decode G.711 audio into TIFF images.
 //! Audio arrives at 16kHz from PJSUA conference bridge; we downsample to 8kHz for SpanDSP.
 
-use anyhow::{Context, Result};
+use super::FaxError;
 use spandsp::fax::FaxState;
 use spandsp::logging::{LogLevel, LogShowFlags};
 use spandsp::spandsp_sys;
@@ -75,19 +75,30 @@ fn configure_t30(
     t30: &spandsp::t30::T30State,
     tiff_path: &str,
     callback_state: &mut FaxCallbackState,
-) -> Result<()> {
+) -> Result<(), FaxError> {
+    /// Local macro: tag a SpanDSP error with the operation name. Avoids
+    /// boilerplate at every setter call site.
+    macro_rules! spandsp_err {
+        ($op:expr) => {
+            |e| FaxError::SpanDsp {
+                operation: $op,
+                detail: e.to_string(),
+            }
+        };
+    }
+
     t30.set_rx_file(tiff_path, -1)
-        .map_err(|e| anyhow::anyhow!("Failed to set rx file: {}", e))?;
+        .map_err(spandsp_err!("set_rx_file"))?;
 
     t30.set_supported_modems(T30ModemSupport::default())
-        .map_err(|e| anyhow::anyhow!("Failed to set supported modems: {}", e))?;
+        .map_err(spandsp_err!("set_supported_modems"))?;
 
     t30.set_ecm_capability(true)
-        .map_err(|e| anyhow::anyhow!("Failed to set ECM: {}", e))?;
+        .map_err(spandsp_err!("set_ecm_capability"))?;
 
     let compressions = T4_COMPRESSION_T4_1D | T4_COMPRESSION_T4_2D | T4_COMPRESSION_T6;
     t30.set_supported_compressions(compressions)
-        .map_err(|e| anyhow::anyhow!("Failed to set compressions: {}", e))?;
+        .map_err(spandsp_err!("set_supported_compressions"))?;
 
     let sizes = T4_SUPPORT_WIDTH_215MM
         | T4_SUPPORT_WIDTH_255MM
@@ -97,7 +108,7 @@ fn configure_t30(
         | T4_RESOLUTION_R8_SUPERFINE
         | T4_RESOLUTION_200_200;
     t30.set_supported_image_sizes(sizes)
-        .map_err(|e| anyhow::anyhow!("Failed to set image sizes: {}", e))?;
+        .map_err(spandsp_err!("set_supported_image_sizes"))?;
 
     let user_data = callback_state as *mut FaxCallbackState as *mut std::ffi::c_void;
     unsafe {
@@ -208,15 +219,20 @@ impl FaxReceiver {
     /// Create a new fax receiver in audio mode.
     ///
     /// Initializes SpanDSP in receive mode and sets the output TIFF path.
-    pub fn new_audio_receiver(tiff_path: &Path) -> Result<Self> {
-        let tiff_path_str = tiff_path.to_str().context("Invalid TIFF path")?;
+    pub fn new_audio_receiver(tiff_path: &Path) -> Result<Self, FaxError> {
+        let tiff_path_str = tiff_path
+            .to_str()
+            .ok_or_else(|| FaxError::NonUtf8Path(tiff_path.display().to_string()))?;
 
-        let fax = FaxState::new(false)
-            .map_err(|e| anyhow::anyhow!("Failed to initialize SpanDSP fax state: {}", e))?;
+        let fax = FaxState::new(false).map_err(|e| FaxError::SpanDsp {
+            operation: "FaxState::new",
+            detail: e.to_string(),
+        })?;
 
-        let t30 = fax
-            .get_t30_state()
-            .map_err(|e| anyhow::anyhow!("Failed to get T.30 state: {}", e))?;
+        let t30 = fax.get_t30_state().map_err(|e| FaxError::SpanDsp {
+            operation: "FaxState::get_t30_state",
+            detail: e.to_string(),
+        })?;
 
         let mut callback_state = Box::new(FaxCallbackState {
             negotiation_started: false,
@@ -350,8 +366,13 @@ impl FaxT38Receiver {
     ///
     /// `tiff_path`: Where to write the received fax TIFF file.
     /// `tx_ifp_sender`: Channel for outgoing IFP packets (sent to UDPTL socket).
-    pub fn new(tiff_path: &Path, tx_ifp_sender: mpsc::UnboundedSender<Vec<u8>>) -> Result<Self> {
-        let tiff_path_str = tiff_path.to_str().context("Invalid TIFF path")?;
+    pub fn new(
+        tiff_path: &Path,
+        tx_ifp_sender: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<Self, FaxError> {
+        let tiff_path_str = tiff_path
+            .to_str()
+            .ok_or_else(|| FaxError::NonUtf8Path(tiff_path.display().to_string()))?;
 
         let tx_callback_state = Box::new(TxCallbackState {
             sender: tx_ifp_sender,
@@ -359,13 +380,18 @@ impl FaxT38Receiver {
         let tx_user_data = &*tx_callback_state as *const TxCallbackState as *mut std::ffi::c_void;
 
         let terminal = unsafe {
-            T38Terminal::new_raw(false, Some(tx_packet_handler), tx_user_data)
-                .map_err(|e| anyhow::anyhow!("Failed to initialize T38Terminal: {}", e))?
+            T38Terminal::new_raw(false, Some(tx_packet_handler), tx_user_data).map_err(|e| {
+                FaxError::SpanDsp {
+                    operation: "T38Terminal::new_raw",
+                    detail: e.to_string(),
+                }
+            })?
         };
 
-        let t30 = terminal
-            .get_t30_state()
-            .map_err(|e| anyhow::anyhow!("Failed to get T.30 state from T38Terminal: {}", e))?;
+        let t30 = terminal.get_t30_state().map_err(|e| FaxError::SpanDsp {
+            operation: "T38Terminal::get_t30_state",
+            detail: e.to_string(),
+        })?;
 
         let mut callback_state = Box::new(FaxCallbackState {
             negotiation_started: false,
@@ -384,7 +410,10 @@ impl FaxT38Receiver {
 
             let t38_core = terminal
                 .get_t38_core_state()
-                .map_err(|e| anyhow::anyhow!("Failed to get T38Core: {}", e))?;
+                .map_err(|e| FaxError::SpanDsp {
+                    operation: "T38Terminal::get_t38_core_state",
+                    detail: e.to_string(),
+                })?;
             configure_log_state(spandsp_sys::t38_core_get_logging_state(t38_core.as_ptr()));
         }
 

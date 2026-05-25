@@ -3,25 +3,32 @@
 //! Standalone SIP-to-Discord voice bridge using a TOML dialplan.
 
 #![feature(portable_simd)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use sipcord_bridge::BridgeError;
 use sipcord_bridge::call::BridgeCoordinator;
-use sipcord_bridge::config::{APP_CONFIG, AppConfig, EnvConfig, SipConfig};
+use sipcord_bridge::config::{APP_CONFIG, AppConfig, ConfigError, EnvConfig, SipConfig};
 use sipcord_bridge::routing::static_router::StaticBackend;
 use sipcord_bridge::transport::discord::SharedDiscordClient;
 use sipcord_bridge::transport::sip::SipTransport;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider()
+async fn main() -> Result<(), BridgeError> {
+    // Pre-init failures here are programmer errors (missing rustls feature
+    // flag, double-init of the global crypto provider) — panicking is the
+    // right behaviour and there's no caller that could recover.
+    if rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .is_err()
+    {
+        panic!("rustls crypto provider already installed or feature missing");
+    }
 
     tracing_subscriber::registry()
         .with(
@@ -39,17 +46,17 @@ async fn main() -> Result<()> {
     let app_config = AppConfig::load(&config_path)?;
     APP_CONFIG
         .set(app_config)
-        .expect("AppConfig already initialized");
+        .map_err(|_| BridgeError::Config(ConfigError::EnvAlreadyInitialised))?;
     info!("Loaded config from {}", config_path.display());
 
     run_static_router().await
 }
 
-async fn run_static_router() -> Result<()> {
+async fn run_static_router() -> Result<(), BridgeError> {
     let bot_token = EnvConfig::global()
         .discord_bot_token
         .clone()
-        .context("DISCORD_BOT_TOKEN required")?;
+        .ok_or(ConfigError::MissingEnvVar("DISCORD_BOT_TOKEN"))?;
     let sip_config = SipConfig::from_env()?;
 
     // Load dialplan
@@ -73,9 +80,7 @@ async fn run_static_router() -> Result<()> {
     });
 
     // Create shared Discord client
-    let shared_discord = SharedDiscordClient::new(&bot_token)
-        .await
-        .expect("Failed to create shared Discord client");
+    let shared_discord = SharedDiscordClient::new(&bot_token).await?;
     info!("Shared Discord client initialized");
 
     let bridge = BridgeCoordinator::new(
@@ -83,7 +88,7 @@ async fn run_static_router() -> Result<()> {
         sip_transport.commands(),
         sip_transport.events(),
         shared_discord,
-    );
+    )?;
 
     info!("Starting components...");
 

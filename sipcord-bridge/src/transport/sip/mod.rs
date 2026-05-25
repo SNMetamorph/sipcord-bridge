@@ -3,6 +3,7 @@ pub mod ffi;
 mod audio_thread;
 mod callbacks;
 mod channel_audio;
+pub mod error;
 pub mod fork_group;
 mod nat;
 mod register_handler;
@@ -24,7 +25,7 @@ pub use register_handler::{PendingRegisterTsx, set_register_event_sender, set_si
 
 use crate::config::{SipConfig, TlsConfig};
 use crate::transport::discord::send_audio_to_discord_direct;
-use anyhow::Result;
+use crate::transport::sip::error::{SipCallError, SipError, SipInitError};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -178,7 +179,7 @@ impl SipTransport {
     }
 
     /// Start the SIP transport
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self) -> Result<(), SipError> {
         info!(
             "Starting SIP server on {}:{}",
             self.config.public_host, self.config.port
@@ -206,7 +207,11 @@ impl SipTransport {
             }
         });
 
-        pjsua_handle.await?;
+        // JoinError -> log only; pjsua loop errors are already logged inside the
+        // spawned task.
+        if let Err(e) = pjsua_handle.await {
+            tracing::error!("pjsua event loop join error: {}", e);
+        }
         Ok(())
     }
 }
@@ -222,7 +227,7 @@ fn run_pjsua_loop(
     event_tx: Sender<SipEvent>,
     initialized: Arc<RwLock<bool>>,
     command_rx: Receiver<SipCommand>,
-) -> Result<()> {
+) -> Result<(), SipInitError> {
     // Initialize pjsua with optional TLS
     init_pjsua(&config, tls_config.as_ref())?;
     *initialized.write() = true;
@@ -449,15 +454,27 @@ fn process_sip_command(cmd: SipCommand, calls: &Arc<DashMap<CallId, CallState>>)
                 }
 
                 if auth_ok {
-                    use register_handler::append_tdata_hdr;
-                    append_tdata_hdr(tdata, c"Expires", &pending.expires.to_string());
+                    use self::ffi::pj_str::append_tdata_hdr;
+                    if let Err(e) =
+                        append_tdata_hdr(tdata, c"Expires", &pending.expires.to_string())
+                    {
+                        tracing::warn!(
+                            "deferred REGISTER 200 OK: failed to append Expires header: {}",
+                            e
+                        );
+                    }
                     // RFC 3261 §10.3: echo the client's binding back as Contact.
                     // Required for strict clients like 3CX to accept registration.
-                    if let Some(ref uri) = pending.contact_uri {
-                        append_tdata_hdr(
+                    if let Some(ref uri) = pending.contact_uri
+                        && let Err(e) = append_tdata_hdr(
                             tdata,
                             c"Contact",
                             &format!("<{}>;expires={}", uri, pending.expires),
+                        )
+                    {
+                        tracing::warn!(
+                            "deferred REGISTER 200 OK: failed to append Contact header ({}); strict clients may reject",
+                            e
                         );
                     }
                 } else {
@@ -506,9 +523,16 @@ pub fn remove_outbound_tracking(call_id: CallId) -> Option<String> {
 ///
 /// If `caller_display_name` is provided, it sets the From header display name
 /// to show who initiated the call from Discord (e.g., "Discord: username").
-fn make_outbound_call(sip_uri: &str, caller_display_name: Option<&str>) -> Result<CallId, String> {
+fn make_outbound_call(
+    sip_uri: &str,
+    caller_display_name: Option<&str>,
+) -> Result<CallId, SipCallError> {
     unsafe {
-        let uri = std::ffi::CString::new(sip_uri).map_err(|e| e.to_string())?;
+        let uri =
+            std::ffi::CString::new(sip_uri).map_err(|source| SipCallError::InvalidString {
+                field: "sip_uri",
+                source,
+            })?;
         let mut call_id: ::pjsua::pjsua_call_id = -1;
 
         // Explicit call settings: audio only, no video, no T.140 text.
@@ -551,7 +575,11 @@ fn make_outbound_call(sip_uri: &str, caller_display_name: Option<&str>) -> Resul
                 .take(64)
                 .collect();
             let from_uri = format!("\"{}\" <{}>", sanitized, acc_uri);
-            from_uri_cstring = std::ffi::CString::new(from_uri).map_err(|e| e.to_string())?;
+            from_uri_cstring =
+                std::ffi::CString::new(from_uri).map_err(|source| SipCallError::InvalidString {
+                    field: "caller_display_name",
+                    source,
+                })?;
             msg_data_ptr.local_uri =
                 ::pjsua::pj_str(from_uri_cstring.as_ptr() as *mut std::os::raw::c_char);
         }
@@ -566,7 +594,7 @@ fn make_outbound_call(sip_uri: &str, caller_display_name: Option<&str>) -> Resul
         );
 
         if status != ::pjsua::pj_constants__PJ_SUCCESS as i32 {
-            return Err(format!("pjsua_call_make_call failed: {}", status));
+            return Err(SipCallError::MakeCall(status));
         }
 
         Ok(CallId::new(call_id))

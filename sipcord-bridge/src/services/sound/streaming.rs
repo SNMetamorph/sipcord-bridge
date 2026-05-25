@@ -6,16 +6,49 @@
 //! Uses Symphonia for FLAC decoding (pure Rust).
 
 use crate::transport::sip::CONF_SAMPLE_RATE;
-use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+
+/// Errors raised by the streaming player.
+#[derive(thiserror::Error, Debug)]
+pub enum StreamingError {
+    #[error("failed to open streaming file {path:?}: {source}")]
+    Open {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to probe streaming format {path:?}: {source}")]
+    Probe {
+        path: PathBuf,
+        #[source]
+        source: symphonia::core::errors::Error,
+    },
+
+    #[error("streaming file {path:?} has no audio track")]
+    NoTrack { path: PathBuf },
+
+    #[error("streaming file {path:?} has no sample rate")]
+    NoSampleRate { path: PathBuf },
+
+    #[error("streaming file {path:?} has wrong sample rate: {got} Hz (expected {expected} Hz)")]
+    WrongSampleRate {
+        path: PathBuf,
+        got: u32,
+        expected: u32,
+    },
+
+    #[error("failed to create streaming decoder: {0}")]
+    Decoder(#[source] symphonia::core::errors::Error),
+}
 
 /// Streaming player for large audio files
 ///
@@ -39,9 +72,11 @@ pub struct StreamingPlayer {
 
 impl StreamingPlayer {
     /// Create a new streaming player for a FLAC file
-    pub fn new(path: &Path) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open streaming file: {}", path.display()))?;
+    pub fn new(path: &Path) -> Result<Self, StreamingError> {
+        let file = File::open(path).map_err(|source| StreamingError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -57,7 +92,10 @@ impl StreamingPlayer {
                 &FormatOptions::default(),
                 &MetadataOptions::default(),
             )
-            .with_context(|| format!("Failed to probe format: {}", path.display()))?;
+            .map_err(|source| StreamingError::Probe {
+                path: path.to_path_buf(),
+                source,
+            })?;
 
         let format = probed.format;
 
@@ -66,7 +104,9 @@ impl StreamingPlayer {
             .tracks()
             .iter()
             .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            .ok_or_else(|| anyhow::anyhow!("No audio track found in {}", path.display()))?;
+            .ok_or_else(|| StreamingError::NoTrack {
+                path: path.to_path_buf(),
+            })?;
 
         let track_id = track.id;
 
@@ -74,15 +114,16 @@ impl StreamingPlayer {
         let sample_rate = track
             .codec_params
             .sample_rate
-            .ok_or_else(|| anyhow::anyhow!("No sample rate in track"))?;
+            .ok_or_else(|| StreamingError::NoSampleRate {
+                path: path.to_path_buf(),
+            })?;
 
         if sample_rate != CONF_SAMPLE_RATE {
-            anyhow::bail!(
-                "Streaming file {} has wrong sample rate: {} Hz (expected {} Hz)",
-                path.display(),
-                sample_rate,
-                CONF_SAMPLE_RATE
-            );
+            return Err(StreamingError::WrongSampleRate {
+                path: path.to_path_buf(),
+                got: sample_rate,
+                expected: CONF_SAMPLE_RATE,
+            });
         }
 
         let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
@@ -99,7 +140,7 @@ impl StreamingPlayer {
 
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
-            .with_context(|| "Failed to create decoder")?;
+            .map_err(StreamingError::Decoder)?;
 
         Ok(Self {
             format,

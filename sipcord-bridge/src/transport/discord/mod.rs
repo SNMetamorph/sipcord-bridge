@@ -2,7 +2,6 @@ mod voice;
 
 use crate::audio::simd;
 use crate::services::snowflake::Snowflake;
-use anyhow::Result;
 use audioadapter::Adapter;
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use crossbeam_channel::Sender;
@@ -28,6 +27,25 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
+
+/// Errors raised by the Discord voice transport.
+#[derive(thiserror::Error, Debug)]
+pub enum DiscordError {
+    /// Discord bot token rejected by serenity (malformed, missing parts, etc.).
+    #[error("invalid Discord bot token: {0}")]
+    InvalidToken(String),
+
+    /// Serenity / songbird error (gateway, REST, voice connect).
+    #[error(transparent)]
+    Serenity(#[from] serenity::Error),
+
+    /// Songbird voice join failed after the configured number of retries.
+    #[error("failed to join voice channel after {attempts} attempts: {last_error}")]
+    JoinFailed {
+        attempts: u32,
+        last_error: String,
+    },
+}
 
 // Direct audio path: SIP audio thread → Discord
 // Uses lock-free ring buffer for real-time audio streaming
@@ -161,16 +179,19 @@ fn create_resampler() -> Async<f64> {
         window: WindowFunction::BlackmanHarris2,
     };
 
-    // 16kHz to 48kHz = ratio of 3.0, mono input, 320 samples per chunk (20ms at 16kHz)
+    // 16kHz to 48kHz = ratio of 3.0, mono input, 320 samples per chunk (20ms at 16kHz).
+    // Params are static and known-good; if rubato rejects them it's a programmer
+    // error (e.g. ratio constants changed inconsistently) and the program can't
+    // run anyway — panic explicitly with the rubato error for diagnostics.
     Async::new_sinc(
-        48000.0 / 16000.0, // resample ratio (3.0x)
-        1.1,               // max relative ratio (allow slight variation)
+        48000.0 / 16000.0,
+        1.1,
         &params,
-        320,               // chunk size (samples per frame at 16kHz)
-        1,                 // mono channel
-        FixedAsync::Input, // fixed input size
+        320,
+        1,
+        FixedAsync::Input,
     )
-    .expect("Failed to create resampler")
+    .unwrap_or_else(|e| panic!("create_resampler: rubato rejected static params: {e}"))
 }
 
 /// RAII guard for a registered Discord audio sender.
@@ -481,7 +502,7 @@ impl SharedDiscordClient {
     /// This opens a single gateway WebSocket connection that stays alive for
     /// the bridge's lifetime. The returned Songbird manager is used by all
     /// voice connections to join/leave channels.
-    pub async fn new(bot_token: &str) -> Result<Arc<Self>> {
+    pub async fn new(bot_token: &str) -> Result<Arc<Self>, DiscordError> {
         info!("Creating shared Discord client (single gateway connection)");
 
         let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
@@ -494,7 +515,7 @@ impl SharedDiscordClient {
 
         let token: Token = bot_token
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid bot token: {}", e))?;
+            .map_err(|e| DiscordError::InvalidToken(format!("{e}")))?;
 
         let mut client = Client::builder(token, intents)
             .event_handler(Arc::new(SharedClientEventHandler { ready_tx }))
@@ -607,7 +628,7 @@ impl DiscordVoiceConnection {
         channel_id: Snowflake,
         event_tx: Sender<DiscordEvent>,
         health_check_notify: Arc<tokio::sync::Notify>,
-    ) -> Result<Self> {
+    ) -> Result<Self, DiscordError> {
         info!(
             "Joining voice channel {} in guild {} for bridge {} (using shared client)",
             channel_id, guild_id, bridge_id
@@ -654,10 +675,12 @@ impl DiscordVoiceConnection {
                     // This allows the pjsua audio thread to bypass tokio entirely
                     let audio_sender = RegisteredAudioSender::new(channel_id, producer);
 
-                    // Create shared timestamp for health tracking
+                    // Create shared timestamp for health tracking. The system
+                    // clock would have to be set before 1970 to produce Err
+                    // here; default to 0 in that case rather than panic.
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_millis() as u64;
                     let last_audio_received = Arc::new(AtomicU64::new(now_ms));
 
@@ -774,11 +797,10 @@ impl DiscordVoiceConnection {
         }
 
         // All retries failed
-        anyhow::bail!(
-            "Failed to join voice channel after {} attempts: {:?}",
-            max_retries,
-            last_error
-        )
+        Err(DiscordError::JoinFailed {
+            attempts: max_retries,
+            last_error: format!("{:?}", last_error),
+        })
     }
 
     /// Send audio to the Discord voice channel
@@ -799,7 +821,7 @@ impl DiscordVoiceConnection {
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         let last_recv = self.inner.last_audio_received.load(Ordering::Relaxed);
@@ -1070,7 +1092,7 @@ impl VoiceEventHandler for VoiceReceiver {
                 // Update health tracking timestamp - VoiceTick arriving means Discord is alive
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
                 self.last_audio_received.store(now_ms, Ordering::Relaxed);
 

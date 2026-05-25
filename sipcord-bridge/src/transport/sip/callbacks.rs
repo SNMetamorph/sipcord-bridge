@@ -49,10 +49,9 @@ use super::ffi::utils::{extract_sip_username, pj_str_to_string};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use pjsua::*;
-use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::net::IpAddr;
-use std::os::raw::{c_char, c_int};
+use std::os::raw::c_int;
 use std::ptr;
 
 /// Global sender for outbound call events (set during initialization)
@@ -112,9 +111,7 @@ pub unsafe fn extract_user_agent(rdata: *const pjsip_rx_data) -> Option<String> 
         }
 
         // Find User-Agent header by name
-        let hdr_name = CString::new("User-Agent").ok()?;
-        let name = pj_str(hdr_name.as_ptr() as *mut c_char);
-
+        let name = super::ffi::pj_str::pj_str_from_cstr(c"User-Agent");
         let hdr = pjsip_msg_find_hdr_by_name(msg, &name, ptr::null_mut());
         if hdr.is_null() {
             return None;
@@ -236,58 +233,16 @@ pub unsafe fn extract_digest_auth_from_rdata(
 /// Send 401 Unauthorized response with WWW-Authenticate header
 pub unsafe fn send_401_challenge(call_id: CallId, www_auth: &str) {
     unsafe {
-        // Create the WWW-Authenticate header
-        let hdr_name = CString::new("WWW-Authenticate").unwrap();
-        let hdr_value = CString::new(www_auth).unwrap();
-
-        // Create msg_data with the WWW-Authenticate header
-        let mut msg_data = MaybeUninit::<pjsua_msg_data>::uninit();
-        pjsua_msg_data_init(msg_data.as_mut_ptr());
-        let msg_data_ptr = msg_data.assume_init_mut();
-
-        // Create a pool for the header
-        let pool = pjsua_pool_create(c"auth".as_ptr(), 512, 512);
-        if pool.is_null() {
-            tracing::error!("Failed to create pool for 401 challenge");
-            pjsua_call_hangup(*call_id, 500, ptr::null(), ptr::null());
-            return;
-        }
-
-        // Create the header
-        let name = pj_str(hdr_name.as_ptr() as *mut c_char);
-        let value = pj_str(hdr_value.as_ptr() as *mut c_char);
-
-        let hdr = pjsip_generic_string_hdr_create(pool, &name, &value);
-
-        if !hdr.is_null() {
-            // Add header to the list using pj_list_insert_before (insert at end of list)
-            pj_list_insert_before(
-                &mut msg_data_ptr.hdr_list as *mut _ as *mut pj_list_type,
-                hdr as *mut pj_list_type,
-            );
-        }
-
-        // Send 401 response - this will cause pjsua to send the response and then
-        // the client should retry with Authorization header
-        let reason = CString::new("Unauthorized").unwrap();
-        let reason_pj = pj_str(reason.as_ptr() as *mut c_char);
-
-        let status = pjsua_call_answer(*call_id, 401, &reason_pj, msg_data_ptr);
-        if status != pj_constants__PJ_SUCCESS as i32 {
-            tracing::warn!(
-                "Failed to send 401 challenge for call {}: {}",
-                call_id,
-                status
-            );
-            // Hangup if we can't send challenge
+        if let Err(e) = super::ffi::pj_str::answer_call_with_headers(
+            *call_id,
+            401,
+            c"Unauthorized",
+            c"auth",
+            &[(c"WWW-Authenticate", www_auth)],
+        ) {
+            tracing::warn!("Failed to send 401 challenge for call {}: {}", call_id, e);
             pjsua_call_hangup(*call_id, 500, ptr::null(), ptr::null());
         }
-
-        // DO NOT release the pool here - PJSUA may still need the header data
-        // after pjsua_call_answer returns. The pool will be cleaned up when
-        // pjsua is destroyed. This leaks ~512 bytes per 401 challenge but
-        // prevents use-after-free crashes.
-        // TODO: Track pools per-call and release them in on_call_state when call ends
     }
 }
 
@@ -329,59 +284,26 @@ pub unsafe fn send_302_redirect(call_id: CallId, target_domain: &str, extension:
 
         // Create the Contact header: sip:extension@target_domain
         let contact_uri = format!("sip:{}@{}", extension, target_domain);
-        let hdr_name = CString::new("Contact").unwrap();
-        let hdr_value = CString::new(contact_uri).unwrap();
 
-        // Create msg_data with the Contact header
-        let mut msg_data = MaybeUninit::<pjsua_msg_data>::uninit();
-        pjsua_msg_data_init(msg_data.as_mut_ptr());
-        let msg_data_ptr = msg_data.assume_init_mut();
-
-        // Create a pool for the header
-        let pool = pjsua_pool_create(c"redirect".as_ptr(), 512, 512);
-        if pool.is_null() {
-            tracing::error!("Failed to create pool for 302 redirect");
-            pjsua_call_hangup(*call_id, 500, ptr::null(), ptr::null());
-            return;
+        match super::ffi::pj_str::answer_call_with_headers(
+            *call_id,
+            302,
+            c"Moved Temporarily",
+            c"redirect",
+            &[(c"Contact", contact_uri.as_str())],
+        ) {
+            Err(e) => {
+                tracing::warn!("Failed to send 302 redirect for call {}: {}", call_id, e);
+                pjsua_call_hangup(*call_id, 500, ptr::null(), ptr::null());
+            }
+            Ok(()) => {
+                tracing::info!(
+                    "Sent 302 redirect for call {} to {}",
+                    call_id,
+                    target_domain
+                );
+            }
         }
-
-        // Create the header
-        let name = pj_str(hdr_name.as_ptr() as *mut c_char);
-        let value = pj_str(hdr_value.as_ptr() as *mut c_char);
-
-        let hdr = pjsip_generic_string_hdr_create(pool, &name, &value);
-
-        if !hdr.is_null() {
-            // Add header to the list using pj_list_insert_before (insert at end of list)
-            pj_list_insert_before(
-                &mut msg_data_ptr.hdr_list as *mut _ as *mut pj_list_type,
-                hdr as *mut pj_list_type,
-            );
-        }
-
-        // Send 302 response
-        let reason = CString::new("Moved Temporarily").unwrap();
-        let reason_pj = pj_str(reason.as_ptr() as *mut c_char);
-
-        let status = pjsua_call_answer(*call_id, 302, &reason_pj, msg_data_ptr);
-        if status != pj_constants__PJ_SUCCESS as i32 {
-            tracing::warn!(
-                "Failed to send 302 redirect for call {}: {}",
-                call_id,
-                status
-            );
-            // Hangup if we can't send redirect
-            pjsua_call_hangup(*call_id, 500, ptr::null(), ptr::null());
-        } else {
-            tracing::info!(
-                "Sent 302 redirect for call {} to {}",
-                call_id,
-                target_domain
-            );
-        }
-
-        // DO NOT release the pool here - PJSUA may still need the header data
-        // after pjsua_call_answer returns. Same issue as send_401_challenge.
     }
 }
 

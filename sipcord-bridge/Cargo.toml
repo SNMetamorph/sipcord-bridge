@@ -83,7 +83,6 @@ rtrb = "0.3.2"
 async-trait = "0.1"
 
 # Utilities
-anyhow = "1.0.100"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }

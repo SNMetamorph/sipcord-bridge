@@ -28,7 +28,8 @@ use crate::transport::sip::{
     clear_channel_stale_audio, empty_bridge_grace_period_secs, register_call_channel,
     register_discord_to_sip, stop_loop, unregister_call_channel, unregister_discord_to_sip,
 };
-use anyhow::Result;
+use crate::BridgeError;
+use crate::services::sound::SoundError;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
@@ -146,16 +147,14 @@ impl BridgeCoordinator {
         sip_cmd_tx: Sender<SipCommand>,
         sip_event_rx: Receiver<SipEvent>,
         shared_discord: Arc<SharedDiscordClient>,
-    ) -> Self {
+    ) -> Result<Self, SoundError> {
         let (discord_event_tx, discord_event_rx) = bounded(1000);
 
         // Load sounds from config.toml
         let sounds_dir = PathBuf::from(&crate::config::EnvConfig::global().sounds_dir);
+        let sound_manager = create_sound_manager(sounds_dir)?;
 
-        let sound_manager = create_sound_manager(sounds_dir)
-            .expect("Failed to create SoundManager - check config.toml and sound files");
-
-        Self {
+        Ok(Self {
             backend,
             sip_cmd_tx,
             sip_event_rx,
@@ -169,11 +168,11 @@ impl BridgeCoordinator {
             discord_event_rx,
             sound_manager,
             shared_discord,
-        }
+        })
     }
 
     /// Run the bridge coordinator (consumes self)
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<(), BridgeError> {
         info!("Bridge coordinator started");
 
         // Shared notify: VoiceReceiver signals this on unexpected DriverDisconnect,
