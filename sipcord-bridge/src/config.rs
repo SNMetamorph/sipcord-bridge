@@ -1,6 +1,12 @@
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
+
+const RTP_PUBLIC_IP_DISCOVERY_URL: &str = "https://api.sipcord.net/ip";
+const RTP_PUBLIC_IP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Errors that can occur loading and validating bridge configuration.
 #[derive(thiserror::Error, Debug)]
@@ -27,6 +33,21 @@ pub enum ConfigError {
 
     #[error("required environment variable {0} is not set")]
     MissingEnvVar(&'static str),
+
+    #[error("failed to discover RTP public IP from {url}: {source}")]
+    RtpPublicIpDiscovery {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("RTP public IP endpoint {url} returned invalid IPv4 address {value:?}: {source}")]
+    InvalidRtpPublicIp {
+        url: String,
+        value: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
 }
 
 /// Global application config (loaded from config.toml)
@@ -34,6 +55,78 @@ pub static APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
 /// Global environment config (parsed once at startup via `envy`)
 static ENV_CONFIG: OnceLock<EnvConfig> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct Ipv4OnlyResolver;
+
+impl Resolve for Ipv4OnlyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|source| -> Box<dyn std::error::Error + Send + Sync> { Box::new(source) })?
+                .filter(SocketAddr::is_ipv4)
+                .collect::<Vec<_>>();
+
+            if addresses.is_empty() {
+                let source: Box<dyn std::error::Error + Send + Sync> =
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        format!("no IPv4 addresses found for {host}"),
+                    ));
+                return Err(source);
+            }
+
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PublicIpResponse {
+    ip: String,
+}
+
+async fn discover_rtp_public_ip(url: &str, timeout: Duration) -> Result<Ipv4Addr, ConfigError> {
+    let client = reqwest::Client::builder()
+        .dns_resolver(Ipv4OnlyResolver)
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .map_err(|source| ConfigError::RtpPublicIpDiscovery {
+            url: url.to_owned(),
+            source,
+        })?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|source| ConfigError::RtpPublicIpDiscovery {
+            url: url.to_owned(),
+            source,
+        })?;
+
+    let payload = response
+        .json::<PublicIpResponse>()
+        .await
+        .map_err(|source| ConfigError::RtpPublicIpDiscovery {
+            url: url.to_owned(),
+            source,
+        })?;
+    let value = payload.ip.trim();
+
+    value
+        .parse::<Ipv4Addr>()
+        .map_err(|source| ConfigError::InvalidRtpPublicIp {
+            url: url.to_owned(),
+            value: value.to_owned(),
+            source,
+        })
+}
 
 fn default_data_dir() -> String {
     "/var/lib/sipcord".to_string()
@@ -109,15 +202,52 @@ pub struct EnvConfig {
 }
 
 impl EnvConfig {
-    /// Parse environment variables (via `envy`) and store in the global `OnceLock`.
-    /// Call once at the top of `main()`.
-    pub fn init() -> Result<(), ConfigError> {
+    fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
-        let cfg: EnvConfig = envy::from_env()?;
+        Ok(envy::from_env()?)
+    }
+
+    fn store(cfg: Self) -> Result<(), ConfigError> {
         ENV_CONFIG
             .set(cfg)
             .map_err(|_| ConfigError::EnvAlreadyInitialised)?;
         Ok(())
+    }
+
+    async fn resolve_rtp_public_ip(
+        &mut self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<(), ConfigError> {
+        if let Some(configured_ip) = self
+            .rtp_public_ip
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            tracing::info!("Using configured RTP public IP: {}", configured_ip);
+            return Ok(());
+        }
+
+        tracing::info!("RTP_PUBLIC_IP not set; discovering public IPv4 address from {url}");
+        let discovered_ip = discover_rtp_public_ip(url, timeout).await?;
+        tracing::info!("Discovered RTP public IP: {}", discovered_ip);
+        self.rtp_public_ip = Some(discovered_ip.to_string());
+        Ok(())
+    }
+
+    /// Parse environment variables (via `envy`) and store in the global `OnceLock`.
+    /// This compatibility initializer does not perform public IP discovery.
+    pub fn init() -> Result<(), ConfigError> {
+        Self::store(Self::from_env()?)
+    }
+
+    /// Parse environment variables, discover a missing RTP public IP, and store
+    /// the completed configuration in the global `OnceLock`.
+    pub async fn init_with_rtp_discovery() -> Result<(), ConfigError> {
+        let mut cfg = Self::from_env()?;
+        cfg.resolve_rtp_public_ip(RTP_PUBLIC_IP_DISCOVERY_URL, RTP_PUBLIC_IP_DISCOVERY_TIMEOUT)
+            .await?;
+        Self::store(cfg)
     }
 
     /// Access the global `EnvConfig`. Panics if `init()` was not called.
@@ -422,6 +552,53 @@ impl TlsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_env(rtp_public_ip: Option<&str>) -> EnvConfig {
+        EnvConfig {
+            data_dir: "/tmp".to_string(),
+            config_path: "./config.toml".to_string(),
+            bridge_id: "br_test".to_string(),
+            sounds_dir: "./wav".to_string(),
+            dev_mode: true,
+            sip_public_host: Some("bridge.example.com".to_string()),
+            sip_port: 5060,
+            rtp_port_start: 10000,
+            rtp_port_end: 15000,
+            rtp_public_ip: rtp_public_ip.map(str::to_string),
+            sip_local_host: None,
+            sip_local_cidr: None,
+            tls_cert_dir: None,
+            tls_port: 5061,
+            tls_refresh_interval: 3600,
+            discord_bot_token: None,
+            dialplan_path: "./dialplan.toml".to_string(),
+        }
+    }
+
+    async fn serve_once(status: &str, body: &str, delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        let body = body.to_owned();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        format!("http://{address}/ip")
+    }
 
     #[test]
     fn test_bridge_config_default() {
@@ -567,5 +744,104 @@ prefix = "test_"
         assert_eq!(config.audio.ring_buffer_samples, 48000);
         assert_eq!(config.fax.prefix, "test_");
         assert!(config.sounds.entries.contains_key("join"));
+    }
+
+    #[tokio::test]
+    async fn configured_rtp_public_ip_skips_discovery() {
+        let mut env = test_env(Some("198.51.100.20"));
+
+        env.resolve_rtp_public_ip("not a valid URL", Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        assert_eq!(env.rtp_public_ip.as_deref(), Some("198.51.100.20"));
+    }
+
+    #[tokio::test]
+    async fn discovery_resolver_returns_only_ipv4_addresses() {
+        let addresses = Ipv4OnlyResolver
+            .resolve("localhost".parse().unwrap())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().all(SocketAddr::is_ipv4));
+    }
+
+    #[tokio::test]
+    async fn missing_rtp_public_ip_is_discovered_and_canonicalized() {
+        let url = serve_once("200 OK", r#"{"ip":" 203.0.113.42 "}"#, Duration::ZERO).await;
+        let mut env = test_env(None);
+
+        env.resolve_rtp_public_ip(&url, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(env.rtp_public_ip.as_deref(), Some("203.0.113.42"));
+    }
+
+    #[tokio::test]
+    async fn blank_rtp_public_ip_is_treated_as_missing() {
+        let url = serve_once("200 OK", r#"{"ip":"198.51.100.7"}"#, Duration::ZERO).await;
+        let mut env = test_env(Some("   "));
+
+        env.resolve_rtp_public_ip(&url, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(env.rtp_public_ip.as_deref(), Some("198.51.100.7"));
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_http_errors() {
+        let url = serve_once(
+            "503 Service Unavailable",
+            r#"{"error":"unavailable"}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let error = discover_rtp_public_ip(&url, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ConfigError::RtpPublicIpDiscovery { .. }));
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_invalid_or_ipv6_addresses() {
+        for value in ["not-an-ip", "2001:db8::42"] {
+            let url = serve_once("200 OK", &format!(r#"{{"ip":"{value}"}}"#), Duration::ZERO).await;
+            let error = discover_rtp_public_ip(&url, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, ConfigError::InvalidRtpPublicIp { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_malformed_json() {
+        let url = serve_once("200 OK", "not json", Duration::ZERO).await;
+        let error = discover_rtp_public_ip(&url, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ConfigError::RtpPublicIpDiscovery { .. }));
+    }
+
+    #[tokio::test]
+    async fn discovery_honors_the_request_timeout() {
+        let url = serve_once(
+            "200 OK",
+            r#"{"ip":"203.0.113.42"}"#,
+            Duration::from_millis(250),
+        )
+        .await;
+        let error = discover_rtp_public_ip(&url, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ConfigError::RtpPublicIpDiscovery { .. }));
     }
 }

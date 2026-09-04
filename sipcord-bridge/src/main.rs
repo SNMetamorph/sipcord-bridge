@@ -37,7 +37,7 @@ async fn main() -> Result<(), BridgeError> {
 
     info!("Starting Sipcord Bridge v{}", env!("CARGO_PKG_VERSION"));
 
-    EnvConfig::init()?;
+    EnvConfig::init_with_rtp_discovery().await?;
 
     let config_path = PathBuf::from(&EnvConfig::global().config_path);
     let app_config = AppConfig::load(&config_path)?;

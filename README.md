@@ -135,7 +135,7 @@ Dial `1000` (or whatever you put in `dialplan.toml`) and you should hear the bot
 | `SIP_PORT` | `5060` | SIP listening port |
 | `RTP_PORT_START` | `10000` | Start of RTP port range |
 | `RTP_PORT_END` | `15000` | End of RTP port range |
-| `RTP_PUBLIC_IP` | *(same as SIP_PUBLIC_HOST)* | Public IP for RTP media (if different from SIP) |
+| `RTP_PUBLIC_IP` | *(auto-detected)* | Public IPv4 address for RTP media; set to override discovery |
 | `CONFIG_PATH` | `./config.toml` | Path to config.toml |
 | `DIALPLAN_PATH` | `./dialplan.toml` | Path to dialplan.toml |
 | `SOUNDS_DIR` | `./wav` | Path to sound files directory |
@@ -149,7 +149,10 @@ If your server is behind NAT, you need to:
 - Forward UDP port 5060 (SIP signaling)
 - Forward UDP ports 10000-15000 (RTP media)
 - Set `SIP_PUBLIC_HOST` to your *public* IP
-- If the public IP for RTP differs from SIP, also set `RTP_PUBLIC_IP`
+- Leave `RTP_PUBLIC_IP` unset to discover it from `https://api.sipcord.net/ip` at startup
+- Set `RTP_PUBLIC_IP` explicitly when the public IP for RTP differs from the bridge's outbound IPv4 address
+
+Automatic discovery requires outbound HTTPS access and fails startup if the endpoint cannot return a valid IPv4 address.
 
 For servers with both a public and private interface (e.g. behind a load balancer), you can set `SIP_LOCAL_HOST` and `SIP_LOCAL_CIDR` so local clients get the private IP in Contact headers:
 
