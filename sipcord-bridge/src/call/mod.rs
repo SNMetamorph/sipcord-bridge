@@ -14,7 +14,7 @@
 //! 7. When caller hangs up, remove from bridge
 //! 8. When last caller leaves, destroy the bridge (disconnect bot)
 
-use crate::fax::session::{FaxSession, FaxSource};
+use crate::fax::session::{FaxSession, FaxSource, call_end_incomplete_reason};
 use crate::fax::spandsp::FaxT38Receiver;
 use crate::routing::{
     Backend, CallError, CallStartedInfo, OutboundCallCommand, OutboundCallDiagnostics,
@@ -1298,30 +1298,28 @@ impl BridgeCoordinator {
                                 session.created_at.elapsed().as_secs_f64(),
                                 session.audio_duration_secs()
                             );
-                            if !session.is_finished() {
-                                // If we received at least one page, the fax data is in the TIFF.
-                                // The remote may have hung up after sending all pages but before
-                                // the T.30 phase E disconnect handshake completed — this is normal.
+                            if !session.is_result_posted() {
+                                // A phase-E result may already have marked the TIFF ready. If the
+                                // call ended first, use phase D's EOP signal to distinguish a normal
+                                // post-document disconnect from an interrupted transfer.
                                 let pages = session.pages_received();
-                                if pages > 0 {
-                                    debug!(
-                                        "Fax call {} ended with {} page(s) received, converting",
-                                        call_id, pages
+                                if !session.is_ready_to_post() {
+                                    let incomplete_reason = call_end_incomplete_reason(
+                                        pages,
+                                        session.document_end_signaled(),
                                     );
-                                    session.state = crate::fax::session::FaxState::Received;
-                                    if let Err(e) = session.convert_and_post().await {
-                                        error!(
-                                            "Failed to convert/post fax for call {}: {}",
-                                            call_id, e
-                                        );
-                                        session
-                                            .post_failure("Failed to process received fax")
-                                            .await;
-                                    }
-                                } else {
-                                    session
-                                        .post_failure("Caller hung up before fax completed")
-                                        .await;
+                                    session.finish_reception(incomplete_reason);
+                                }
+                                debug!(
+                                    "Fax call {} ended with {} page(s) reported, attempting conversion",
+                                    call_id, pages
+                                );
+                                if let Err(e) = session.convert_and_post().await {
+                                    error!(
+                                        "Failed to convert/post fax for call {}: {}",
+                                        call_id, e
+                                    );
+                                    session.post_failure("Failed to process received fax").await;
                                 }
                             }
                             sip_calls.remove(&call_id);
@@ -3397,11 +3395,8 @@ async fn process_fax_audio(
 
         // 3. Check for completion / errors / timeout
         if session.is_finished() {
-            if matches!(
-                session.state,
-                crate::fax::session::FaxState::Received | crate::fax::session::FaxState::Complete
-            ) {
-                debug!("Fax {} reception complete, converting and posting", call_id);
+            if session.is_ready_to_post() {
+                debug!("Fax {} reception ended, converting and posting", call_id);
                 if let Err(e) = session.convert_and_post().await {
                     error!("Failed to convert/post fax for call {}: {}", call_id, e);
                     session.post_failure("Failed to process received fax").await;
@@ -3413,7 +3408,14 @@ async fn process_fax_audio(
 
         if session.is_timed_out() {
             warn!("Fax {} timed out during processing", call_id);
-            session.post_failure("Fax reception timed out").await;
+            session.finish_reception(Some("Fax reception timed out".to_string()));
+            if let Err(e) = session.convert_and_post().await {
+                error!(
+                    "Failed to recover timed-out fax for call {}: {}",
+                    call_id, e
+                );
+                session.post_failure("Fax reception timed out").await;
+            }
             let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
             break;
         }
@@ -3744,7 +3746,7 @@ async fn process_fax_t38(
                         }
 
                         if completed {
-                            debug!("Fax {} T.38 reception complete, converting and posting", call_id);
+                            debug!("Fax {} T.38 reception ended, converting and posting", call_id);
                             if let Err(e) = session.convert_and_post().await {
                                 error!("Failed to convert/post fax for call {}: {}", call_id, e);
                                 session.post_failure("Failed to process received fax").await;
@@ -3788,7 +3790,14 @@ async fn process_fax_t38(
 
                 if session.is_timed_out() {
                     warn!("Fax {} T.38 timed out during processing", call_id);
-                    session.post_failure("Fax reception timed out").await;
+                    session.finish_reception(Some("Fax reception timed out".to_string()));
+                    if let Err(e) = session.convert_and_post().await {
+                        error!(
+                            "Failed to recover timed-out T.38 fax for call {}: {}",
+                            call_id, e
+                        );
+                        session.post_failure("Fax reception timed out").await;
+                    }
                     let _ = sip_cmd_tx.send(SipCommand::Hangup { call_id });
                     break;
                 }

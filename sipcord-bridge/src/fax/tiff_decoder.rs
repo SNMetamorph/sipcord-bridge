@@ -8,6 +8,7 @@
 
 use super::{FaxError, FaxPageDataError};
 use image::GrayImage;
+use std::error::Error as _;
 use std::path::Path;
 use std::sync::OnceLock;
 use tracing::debug;
@@ -31,13 +32,68 @@ const MAX_TIFF_SIZE: u64 = 50 * 1024 * 1024;
 /// by corrupt transfers while retaining unusually short but still usable documents.
 const MIN_DECODED_PAGE_ROWS: u32 = 64;
 
+/// A partial page must contain at least this fraction of its declared height.
+/// The absolute floor above still applies to malformed or unusually short pages.
+const MIN_DECODED_PAGE_PERCENT: u32 = 10;
+
 /// Small row-count differences can be caused by end-of-page marker handling. Permit
 /// eight rows for short pages or 1% for longer pages, whichever is greater.
 const MIN_ALLOWED_ROW_DIFFERENCE: u32 = 8;
 const ALLOWED_ROW_DIFFERENCE_PERCENT: u32 = 1;
 
-/// Decode all pages of a fax TIFF file into grayscale images.
+/// A decoded fax page and whether all of its declared rows were recoverable.
+#[derive(Debug)]
+pub(crate) struct DecodedFaxPage {
+    pub(crate) page_number: usize,
+    pub(crate) image: GrayImage,
+    pub(crate) completeness: FaxPageCompleteness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaxPageCompleteness {
+    Complete,
+    Partial {
+        decoded_rows: u32,
+        declared_rows: u32,
+    },
+}
+
+/// A TIFF page which could not produce a useful image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OmittedFaxPage {
+    pub(crate) page_number: usize,
+    pub(crate) reason: String,
+}
+
+/// Best-effort decode result. Useful pages are retained even if another page is
+/// incomplete or corrupt.
+#[derive(Debug)]
+pub(crate) struct DecodedFax {
+    pub(crate) pages: Vec<DecodedFaxPage>,
+    pub(crate) omitted_pages: Vec<OmittedFaxPage>,
+}
+
+impl DecodedFax {
+    pub(crate) fn is_incomplete(&self) -> bool {
+        !self.omitted_pages.is_empty()
+            || self
+                .pages
+                .iter()
+                .any(|page| matches!(page.completeness, FaxPageCompleteness::Partial { .. }))
+    }
+}
+
+/// Decode every useful page of a fax TIFF file into a grayscale image.
+///
+/// Unreadable pages and fragments below the usefulness threshold are omitted.
+/// An error is returned only when no useful page can be recovered.
 pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
+    decode_fax_tiff_with_report(path)
+        .map(|decoded| decoded.pages.into_iter().map(|page| page.image).collect())
+}
+
+/// Decode useful pages while retaining page numbers and recovery diagnostics.
+pub(crate) fn decode_fax_tiff_with_report(path: &Path) -> Result<DecodedFax, FaxError> {
     if !path.exists() {
         tiff_bail!("TIFF file not found: {}", path.display());
     }
@@ -60,11 +116,14 @@ pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
     })?;
     let pages = parse_tiff_ifds(&data)?;
     let mut images = Vec::with_capacity(pages.len());
+    let mut omitted_pages = Vec::new();
+    let mut first_page_error = None;
 
     for (i, page) in pages.iter().enumerate() {
+        let page_number = i + 1;
         debug!(
             "TIFF page {}: {}x{}, compression={}, fill_order={}, t4_options={}",
-            i + 1,
+            page_number,
             page.width,
             page.height,
             page.compression,
@@ -72,35 +131,50 @@ pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
             page.t4_options
         );
 
-        let mut strip_data = Vec::new();
-        for (off, len) in page.strip_offsets.iter().zip(&page.strip_byte_counts) {
-            let start = *off as usize;
-            let end = start + *len as usize;
-            if end > data.len() {
-                tiff_bail!(
-                    "TIFF strip extends past file: offset={}, count={}, file_len={}",
-                    off,
-                    len,
-                    data.len()
+        let transitions_per_line = match decode_tiff_page(&data, page) {
+            Ok(lines) => lines,
+            Err(error) => {
+                let reason = error.to_string();
+                debug!(
+                    "Omitting unreadable TIFF page {} during best-effort decode: {}",
+                    page_number, reason
                 );
+                omitted_pages.push(OmittedFaxPage {
+                    page_number,
+                    reason,
+                });
+                if first_page_error.is_none() {
+                    first_page_error = Some(error);
+                }
+                continue;
             }
-            strip_data.extend_from_slice(&data[start..end]);
-        }
-
-        // FillOrder=2: reverse bits in every byte
-        if page.fill_order == 2 {
-            for b in strip_data.iter_mut() {
-                *b = BIT_REVERSE_LUT[*b as usize];
-            }
-        }
-
-        let transitions_per_line = match page.compression {
-            3 => decode_group3(&strip_data, page.width, page.height, page.t4_options)?,
-            4 => decode_group4(&strip_data, page.width, page.height)?,
-            other => tiff_bail!("Unsupported TIFF compression: {}", other),
         };
 
-        validate_decoded_page_rows(i + 1, page.height, transitions_per_line.len())?;
+        let completeness = match classify_decoded_page_rows(
+            page_number,
+            page.height,
+            transitions_per_line.len(),
+        ) {
+            Ok(completeness) => completeness,
+            Err(error) => {
+                let reason = error
+                    .source()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| error.to_string());
+                debug!(
+                    "Omitting undersized TIFF page {} during best-effort decode: {}",
+                    page_number, reason
+                );
+                omitted_pages.push(OmittedFaxPage {
+                    page_number,
+                    reason,
+                });
+                if first_page_error.is_none() {
+                    first_page_error = Some(error);
+                }
+                continue;
+            }
+        };
 
         let img = assemble_image(
             &transitions_per_line,
@@ -111,26 +185,88 @@ pub fn decode_fax_tiff(path: &Path) -> Result<Vec<GrayImage>, FaxError> {
 
         // Correct aspect ratio for non-square pixels (e.g., 204×98 DPI standard fax)
         let img = correct_aspect_ratio(img, page.x_resolution, page.y_resolution);
-        images.push(img);
+        images.push(DecodedFaxPage {
+            page_number,
+            image: img,
+            completeness,
+        });
     }
 
-    Ok(images)
+    if images.is_empty() {
+        return Err(first_page_error.unwrap_or(FaxError::NoPages));
+    }
+
+    Ok(DecodedFax {
+        pages: images,
+        omitted_pages,
+    })
 }
 
-/// Ensure a decoded TIFF page is substantial and agrees with its declared height
-/// before allocating an image for it.
-fn validate_decoded_page_rows(
+fn decode_tiff_page(data: &[u8], page: &TiffPage) -> Result<Vec<Vec<u16>>, FaxError> {
+    if page.strip_offsets.len() != page.strip_byte_counts.len() {
+        tiff_bail!(
+            "TIFF strip table mismatch: {} offsets, {} byte counts",
+            page.strip_offsets.len(),
+            page.strip_byte_counts.len()
+        );
+    }
+    if page.strip_offsets.is_empty() {
+        tiff_bail!("TIFF page has no image strips");
+    }
+
+    let mut strip_data = Vec::new();
+    for (off, len) in page.strip_offsets.iter().zip(&page.strip_byte_counts) {
+        let start = *off as usize;
+        let Some(end) = start.checked_add(*len as usize) else {
+            tiff_bail!("TIFF strip range overflows: offset={}, count={}", off, len);
+        };
+        if end > data.len() {
+            tiff_bail!(
+                "TIFF strip extends past file: offset={}, count={}, file_len={}",
+                off,
+                len,
+                data.len()
+            );
+        }
+        strip_data.extend_from_slice(&data[start..end]);
+    }
+
+    // FillOrder=2: reverse bits in every byte
+    if page.fill_order == 2 {
+        for b in &mut strip_data {
+            *b = BIT_REVERSE_LUT[*b as usize];
+        }
+    }
+
+    match page.compression {
+        3 => decode_group3(&strip_data, page.width, page.height, page.t4_options),
+        4 => decode_group4(&strip_data, page.width, page.height),
+        other => Err(FaxError::Tiff(format!(
+            "Unsupported TIFF compression: {other}"
+        ))),
+    }
+}
+
+fn minimum_useful_rows(declared_rows: u32) -> u32 {
+    let relative_rows =
+        ((declared_rows as u64 * MIN_DECODED_PAGE_PERCENT as u64).div_ceil(100)) as u32;
+    MIN_DECODED_PAGE_ROWS.max(relative_rows)
+}
+
+/// Classify a decoded TIFF page, rejecting only fragments too small to be useful.
+fn classify_decoded_page_rows(
     page_number: usize,
     declared_rows: u32,
     decoded_rows: usize,
-) -> Result<(), FaxError> {
+) -> Result<FaxPageCompleteness, FaxError> {
     let decoded_rows = u32::try_from(decoded_rows).unwrap_or(u32::MAX);
+    let minimum_rows = minimum_useful_rows(declared_rows);
 
-    if decoded_rows < MIN_DECODED_PAGE_ROWS {
+    if decoded_rows < minimum_rows {
         return Err(FaxError::CorruptPageData(FaxPageDataError::TooShort {
             page_number,
             decoded_rows,
-            minimum_rows: MIN_DECODED_PAGE_ROWS,
+            minimum_rows,
         }));
     }
 
@@ -141,18 +277,13 @@ fn validate_decoded_page_rows(
     let difference = declared_rows.abs_diff(decoded_rows);
 
     if difference > allowed_difference {
-        return Err(FaxError::CorruptPageData(
-            FaxPageDataError::RowCountMismatch {
-                page_number,
-                decoded_rows,
-                declared_rows,
-                difference,
-                allowed_difference,
-            },
-        ));
+        return Ok(FaxPageCompleteness::Partial {
+            decoded_rows,
+            declared_rows,
+        });
     }
 
-    Ok(())
+    Ok(FaxPageCompleteness::Complete)
 }
 
 // TIFF IFD Parser
@@ -1158,6 +1289,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_decode_example_with_half_declared_page_recovers_partial_image() {
+        let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fax/example.tiff");
+        let mut data = std::fs::read(&source_path).expect("Failed to read example.tiff");
+
+        // Double ImageLength while leaving the encoded strip unchanged. This
+        // models a transfer whose TIFF declares a full page but whose data ends
+        // after the useful first half.
+        let le = matches!((data[0], data[1]), (0x49, 0x49));
+        let ifd_offset = read_u32(&data, 4, le) as usize;
+        let num_entries = read_u16(&data, ifd_offset, le) as usize;
+        let height_entry = (0..num_entries)
+            .map(|index| ifd_offset + 2 + index * 12)
+            .find(|&offset| read_u16(&data, offset, le) == 257)
+            .expect("example TIFF must contain ImageLength");
+        let doubled_height = 4_398u16;
+        let encoded_height = if le {
+            doubled_height.to_le_bytes()
+        } else {
+            doubled_height.to_be_bytes()
+        };
+        data[height_entry + 8..height_entry + 10].copy_from_slice(&encoded_height);
+
+        let temp_path = std::env::temp_dir().join(format!(
+            "sipcord-partial-fax-{}-{}.tiff",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&temp_path, data).expect("Failed to write partial TIFF fixture");
+        let result = decode_fax_tiff_with_report(&temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+
+        let decoded = result.expect("a half-page TIFF should be recoverable");
+        assert_eq!(decoded.pages.len(), 1);
+        assert!(decoded.omitted_pages.is_empty());
+        let FaxPageCompleteness::Partial {
+            decoded_rows,
+            declared_rows,
+        } = decoded.pages[0].completeness
+        else {
+            panic!("the recovered page must be marked partial");
+        };
+        assert_eq!(decoded_rows, 2_199);
+        assert_eq!(declared_rows, 4_398);
+        assert!(decoded.pages[0].image.height() < declared_rows);
+    }
+
+    #[test]
+    fn test_decode_keeps_good_page_when_later_page_is_unreadable() {
+        let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fax/example.tiff");
+        let mut data = std::fs::read(&source_path).expect("Failed to read example.tiff");
+        let le = matches!((data[0], data[1]), (0x49, 0x49));
+        let first_ifd_offset = read_u32(&data, 4, le) as usize;
+        let num_entries = read_u16(&data, first_ifd_offset, le) as usize;
+        let ifd_len = 2 + num_entries * 12 + 4;
+        let second_ifd = data[first_ifd_offset..first_ifd_offset + ifd_len].to_vec();
+        let second_ifd_offset = data.len();
+
+        // Link a copy of the first page's IFD as page 2, then give only that
+        // page an unsupported compression. The first page must still survive.
+        let first_next_ifd = first_ifd_offset + 2 + num_entries * 12;
+        let encoded_offset = if le {
+            (second_ifd_offset as u32).to_le_bytes()
+        } else {
+            (second_ifd_offset as u32).to_be_bytes()
+        };
+        data[first_next_ifd..first_next_ifd + 4].copy_from_slice(&encoded_offset);
+        data.extend_from_slice(&second_ifd);
+
+        let compression_entry = (0..num_entries)
+            .map(|index| second_ifd_offset + 2 + index * 12)
+            .find(|&offset| read_u16(&data, offset, le) == 259)
+            .expect("example TIFF must contain Compression");
+        let unsupported_compression = if le {
+            99u16.to_le_bytes()
+        } else {
+            99u16.to_be_bytes()
+        };
+        data[compression_entry + 8..compression_entry + 10]
+            .copy_from_slice(&unsupported_compression);
+
+        let temp_path = std::env::temp_dir().join(format!(
+            "sipcord-multipage-fax-{}-{}.tiff",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&temp_path, data).expect("Failed to write multipage TIFF fixture");
+        let result = decode_fax_tiff_with_report(&temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+
+        let decoded = result.expect("the readable first page should be retained");
+        assert_eq!(decoded.pages.len(), 1);
+        assert_eq!(decoded.pages[0].page_number, 1);
+        assert_eq!(decoded.omitted_pages.len(), 1);
+        assert_eq!(decoded.omitted_pages[0].page_number, 2);
+        assert!(decoded.omitted_pages[0].reason.contains("compression"));
+        assert!(decoded.is_incomplete());
+    }
+
     /// Verify that resolution tags are parsed from example.tiff.
     #[test]
     fn test_parse_resolution_tags() {
@@ -1337,7 +1567,7 @@ mod tests {
 
     #[test]
     fn decoded_page_rows_rejects_tiny_page_fragments() {
-        let result = validate_decoded_page_rows(2, 4, 4);
+        let result = classify_decoded_page_rows(2, 4, 4);
         let err = result.expect_err("four decoded rows must be rejected");
         assert_eq!(
             err.to_string(),
@@ -1358,41 +1588,69 @@ mod tests {
 
     #[test]
     fn decoded_page_rows_accepts_minimum_usable_height() {
-        validate_decoded_page_rows(1, MIN_DECODED_PAGE_ROWS, MIN_DECODED_PAGE_ROWS as usize)
-            .expect("a page at the minimum usable height should be accepted");
+        let completeness =
+            classify_decoded_page_rows(1, MIN_DECODED_PAGE_ROWS, MIN_DECODED_PAGE_ROWS as usize)
+                .expect("a page at the minimum usable height should be accepted");
+        assert_eq!(completeness, FaxPageCompleteness::Complete);
     }
 
     #[test]
     fn decoded_page_rows_tolerates_small_declared_height_difference() {
-        validate_decoded_page_rows(1, 500, 492)
-            .expect("the eight-row absolute tolerance should be accepted");
-        validate_decoded_page_rows(1, 2_200, 2_178)
-            .expect("a one-percent difference on a full page should be accepted");
+        assert_eq!(
+            classify_decoded_page_rows(1, 500, 492)
+                .expect("the eight-row absolute tolerance should be accepted"),
+            FaxPageCompleteness::Complete
+        );
+        assert_eq!(
+            classify_decoded_page_rows(1, 2_200, 2_178)
+                .expect("a one-percent difference on a full page should be accepted"),
+            FaxPageCompleteness::Complete
+        );
     }
 
     #[test]
-    fn decoded_page_rows_rejects_significant_declared_height_difference() {
-        let result = validate_decoded_page_rows(1, 2_200, 2_177);
-        let err = result.expect_err("a row difference over one percent must be rejected");
-        assert_eq!(
-            err.to_string(),
-            "Fax received with corrupt/incomplete page data"
-        );
-        let FaxError::CorruptPageData(FaxPageDataError::RowCountMismatch {
-            page_number,
+    fn decoded_page_rows_marks_significant_difference_partial() {
+        let completeness = classify_decoded_page_rows(1, 2_200, 1_100)
+            .expect("a useful half-page must be retained");
+        let FaxPageCompleteness::Partial {
             decoded_rows,
             declared_rows,
-            difference,
-            allowed_difference,
-        }) = err
+        } = completeness
         else {
-            panic!("row mismatch must return CorruptPageData");
+            panic!("a half-page must be classified as partial");
         };
-        assert_eq!(page_number, 1);
-        assert_eq!(decoded_rows, 2_177);
+        assert_eq!(decoded_rows, 1_100);
         assert_eq!(declared_rows, 2_200);
-        assert_eq!(difference, 23);
-        assert_eq!(allowed_difference, 22);
+    }
+
+    #[test]
+    fn minimum_useful_rows_uses_absolute_and_relative_floors() {
+        assert_eq!(minimum_useful_rows(4), 64);
+        assert_eq!(minimum_useful_rows(640), 64);
+        assert_eq!(minimum_useful_rows(641), 65);
+        assert_eq!(minimum_useful_rows(2_200), 220);
+    }
+
+    #[test]
+    fn decoded_page_rows_enforces_ten_percent_boundary() {
+        let err = classify_decoded_page_rows(1, 2_200, 219)
+            .expect_err("less than ten percent must be rejected");
+        assert!(matches!(
+            err,
+            FaxError::CorruptPageData(FaxPageDataError::TooShort {
+                minimum_rows: 220,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            classify_decoded_page_rows(1, 2_200, 220)
+                .expect("exactly ten percent must be retained"),
+            FaxPageCompleteness::Partial {
+                decoded_rows: 220,
+                declared_rows: 2_200
+            }
+        ));
     }
 
     #[test]

@@ -39,6 +39,11 @@ const T4_RESOLUTION_200_100: i32 = 0x20; // 200×100 DPI
 const T4_RESOLUTION_200_200: i32 = 0x40; // 200×200 DPI
 const T4_RESOLUTION_200_400: i32 = 0x80; // 200×400 DPI
 
+// T.30 phase-D event codes are exposed by the low-level bindings but not the
+// safe wrapper.
+const T30_EOP: i32 = spandsp_sys::T30_EOP as i32;
+const T30_PRI_EOP: i32 = spandsp_sys::T30_PRI_EOP as i32;
+
 const SUPPORTED_IMAGE_SIZES: i32 = T4_SUPPORT_WIDTH_215MM
     | T4_SUPPORT_WIDTH_255MM
     | T4_SUPPORT_WIDTH_303MM
@@ -74,6 +79,9 @@ struct FaxCallbackState {
     negotiation_started: bool,
     /// Number of pages received (phase D count)
     pages_received: u32,
+    /// Whether the sender identified the most recent page as the end of the
+    /// procedure. This lets a subsequent call disconnect count as normal.
+    document_end_signaled: bool,
     /// Final completion code from phase E (-1 = not yet completed)
     completion_code: i32,
     /// Whether phase E (completion) has fired
@@ -179,6 +187,11 @@ fn check_completion(state: &FaxCallbackState) -> FaxRxStatus {
     }
 }
 
+fn is_end_of_procedure(result: i32) -> bool {
+    // The low bit can carry the DIS/DTC received flag in some callback paths.
+    matches!(result & !1, T30_EOP | T30_PRI_EOP)
+}
+
 /// Extract transfer statistics from a T.30 state.
 fn get_fax_stats(t30: &spandsp::t30::T30State) -> FaxStats {
     let stats = t30.get_transfer_statistics();
@@ -264,6 +277,7 @@ impl FaxReceiver {
         let mut callback_state = Box::new(FaxCallbackState {
             negotiation_started: false,
             pages_received: 0,
+            document_end_signaled: false,
             completion_code: -1,
             completed: false,
         });
@@ -329,6 +343,23 @@ impl FaxReceiver {
     /// Number of pages received so far.
     pub fn pages_received(&self) -> u32 {
         self.callback_state.pages_received
+    }
+
+    pub(crate) fn document_end_signaled(&self) -> bool {
+        self.callback_state.document_end_signaled
+    }
+
+    /// Tell SpanDSP that the call has ended, closing any completed TIFF pages
+    /// before the file is read by the recovery path.
+    pub(crate) fn terminate_reception(&mut self) -> Result<(), FaxError> {
+        let t30 = self.fax.get_t30_state().map_err(|e| FaxError::SpanDsp {
+            operation: "FaxState::get_t30_state",
+            detail: e.to_string(),
+        })?;
+        // SAFETY: `t30` belongs to `self.fax`, which remains alive, and this
+        // method has exclusive access to the receiver and callback state.
+        unsafe { spandsp_sys::t30_terminate(t30.as_ptr()) };
+        Ok(())
     }
 
     /// Whether SpanDSP has entered T.30 phase B negotiation.
@@ -428,6 +459,7 @@ impl FaxT38Receiver {
         let mut callback_state = Box::new(FaxCallbackState {
             negotiation_started: false,
             pages_received: 0,
+            document_end_signaled: false,
             completion_code: -1,
             completed: false,
         });
@@ -497,6 +529,26 @@ impl FaxT38Receiver {
     /// Number of pages received so far.
     pub fn pages_received(&self) -> u32 {
         self.callback_state.pages_received
+    }
+
+    pub(crate) fn document_end_signaled(&self) -> bool {
+        self.callback_state.document_end_signaled
+    }
+
+    /// Tell SpanDSP that the call has ended, closing any completed TIFF pages
+    /// before the file is read by the recovery path.
+    pub(crate) fn terminate_reception(&mut self) -> Result<(), FaxError> {
+        let t30 = self
+            .terminal
+            .get_t30_state()
+            .map_err(|e| FaxError::SpanDsp {
+                operation: "T38Terminal::get_t30_state",
+                detail: e.to_string(),
+            })?;
+        // SAFETY: `t30` belongs to `self.terminal`, which remains alive, and
+        // this method has exclusive access to the receiver and callback state.
+        unsafe { spandsp_sys::t30_terminate(t30.as_ptr()) };
+        Ok(())
     }
 
     /// Whether SpanDSP has entered T.30 phase B negotiation.
@@ -577,9 +629,10 @@ unsafe extern "C" fn phase_d_handler(user_data: *mut std::ffi::c_void, result: i
     if !user_data.is_null() {
         let state = unsafe { &mut *(user_data as *mut FaxCallbackState) };
         state.pages_received += 1;
+        state.document_end_signaled = is_end_of_procedure(result);
         info!(
-            "SpanDSP phase D: page {} received (result={})",
-            state.pages_received, result
+            "SpanDSP phase D: page {} received (result={}, end_of_procedure={})",
+            state.pages_received, result, state.document_end_signaled
         );
     }
     0 // T30_ERR_OK
@@ -670,6 +723,7 @@ mod tests {
         let state = FaxCallbackState {
             negotiation_started: false,
             pages_received: 0,
+            document_end_signaled: false,
             completion_code: -1,
             completed: false,
         };
@@ -681,6 +735,7 @@ mod tests {
         let state = FaxCallbackState {
             negotiation_started: true,
             pages_received: 1,
+            document_end_signaled: true,
             completion_code: 0,
             completed: true,
         };
@@ -692,6 +747,7 @@ mod tests {
         let state = FaxCallbackState {
             negotiation_started: true,
             pages_received: 0,
+            document_end_signaled: false,
             completion_code: 42,
             completed: true,
         };
@@ -703,6 +759,15 @@ mod tests {
             ),
             other => panic!("Expected Error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn phase_d_end_of_procedure_detection() {
+        assert!(is_end_of_procedure(T30_EOP));
+        assert!(is_end_of_procedure(T30_PRI_EOP));
+        assert!(is_end_of_procedure(T30_EOP | 1));
+        assert!(!is_end_of_procedure(spandsp_sys::T30_MPS as i32));
+        assert!(!is_end_of_procedure(spandsp_sys::T30_EOM as i32));
     }
 
     // downsample_16k_to_8k tests

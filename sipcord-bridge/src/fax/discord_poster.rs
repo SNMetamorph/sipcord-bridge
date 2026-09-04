@@ -3,6 +3,7 @@
 //! Posts embed messages through the fax lifecycle:
 //! - "Receiving fax..." (blurple) when negotiation starts
 //! - Replaced with "Fax Received" (green) with page image gallery on success
+//! - Replaced with "Fax Incomplete" (amber) when useful partial data was recovered
 //! - Edited to "Fax Failed" (red) with reason on failure
 
 use super::FaxError;
@@ -18,8 +19,67 @@ use tracing::{debug, error, warn};
 
 const COLOR_RECEIVING: u32 = 0x5865F2; // Discord blurple
 const COLOR_COMPLETE: u32 = 0x57F287; // Green
+const COLOR_INCOMPLETE: u32 = 0xF0B232; // Amber
 const COLOR_FAILED: u32 = 0xED4245; // Red
 const GALLERY_URL: &str = "https://sipcord.net/fax";
+
+/// An encoded page ready to attach to Discord. `page_number` is the original
+/// TIFF page number, so gaps remain visible when an unreadable page is omitted.
+pub(crate) struct FaxPageAttachment {
+    pub(crate) page_number: usize,
+    pub(crate) data: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum FaxPostKind {
+    Complete,
+    Incomplete,
+}
+
+struct FaxPresentation {
+    title: &'static str,
+    description: String,
+    color: u32,
+}
+
+fn fax_presentation(kind: FaxPostKind, page_count: u32, has_overflow: bool) -> FaxPresentation {
+    match kind {
+        FaxPostKind::Complete => {
+            let description = if page_count == 1 {
+                "Fax received — 1 page".to_string()
+            } else if has_overflow {
+                format!("Fax received — {page_count} pages (showing first 10)")
+            } else {
+                format!("Fax received — {page_count} pages")
+            };
+            FaxPresentation {
+                title: "Fax Received",
+                description,
+                color: COLOR_COMPLETE,
+            }
+        }
+        FaxPostKind::Incomplete => {
+            let pages = if page_count == 1 { "page" } else { "pages" };
+            let overflow = if has_overflow {
+                " (showing first 10)"
+            } else {
+                ""
+            };
+            FaxPresentation {
+                title: "Fax Incomplete",
+                description: format!(
+                    "Fax transmission incomplete — recovered {page_count} {pages}{overflow}. \
+                     Some content may be missing; partial pages are shown as received."
+                ),
+                color: COLOR_INCOMPLETE,
+            }
+        }
+    }
+}
+
+fn fax_page_filename(page_number: usize, file_ext: &str) -> String {
+    format!("fax_page_{page_number}.{file_ext}")
+}
 
 pub struct DiscordPoster {
     http: Arc<Http>,
@@ -110,40 +170,75 @@ impl DiscordPoster {
         page_count: u32,
         file_ext: &str,
     ) -> Result<(), FaxError> {
+        let image_pages = image_pages
+            .into_iter()
+            .enumerate()
+            .map(|(index, data)| FaxPageAttachment {
+                page_number: index + 1,
+                data,
+            })
+            .collect();
+        self.edit_fax_result(
+            message_id,
+            image_pages,
+            page_count,
+            file_ext,
+            FaxPostKind::Complete,
+        )
+        .await
+    }
+
+    /// Replace the status message with every useful page recovered from an
+    /// incomplete transfer.
+    pub(crate) async fn edit_fax_incomplete(
+        &self,
+        message_id: u64,
+        image_pages: Vec<FaxPageAttachment>,
+        file_ext: &str,
+    ) -> Result<(), FaxError> {
+        let page_count = image_pages.len() as u32;
+        self.edit_fax_result(
+            message_id,
+            image_pages,
+            page_count,
+            file_ext,
+            FaxPostKind::Incomplete,
+        )
+        .await
+    }
+
+    async fn edit_fax_result(
+        &self,
+        message_id: u64,
+        image_pages: Vec<FaxPageAttachment>,
+        page_count: u32,
+        file_ext: &str,
+        kind: FaxPostKind,
+    ) -> Result<(), FaxError> {
         /// Discord's maximum number of embeds per message.
         const MAX_EMBEDS: u32 = 10;
 
         let embed_count = page_count.min(MAX_EMBEDS);
         let has_overflow = page_count > MAX_EMBEDS;
-
-        let description = if page_count == 1 {
-            "Fax received — 1 page".to_string()
-        } else if has_overflow {
-            format!(
-                "Fax received — {} pages (showing first {})",
-                page_count, MAX_EMBEDS
-            )
-        } else {
-            format!("Fax received — {} pages", page_count)
-        };
+        let presentation = fax_presentation(kind, page_count, has_overflow);
 
         // One embed per page (up to MAX_EMBEDS) with a shared URL for gallery rendering
         let mut embeds = Vec::with_capacity(embed_count as usize);
-        for i in 0..embed_count {
-            let filename = format!("fax_page_{}.{}", i + 1, file_ext);
+        for (index, page) in image_pages.iter().take(embed_count as usize).enumerate() {
+            let filename = fax_page_filename(page.page_number, file_ext);
             let image_url = format!("attachment://{}", filename);
 
-            let embed = if i == 0 {
+            let embed = if index == 0 {
                 CreateEmbed::new()
-                    .title("Fax Received")
-                    .description(description.clone())
-                    .color(COLOR_COMPLETE)
+                    .title(presentation.title)
+                    .description(presentation.description.clone())
+                    .color(presentation.color)
                     .url(GALLERY_URL)
                     .image(image_url)
                     .footer(self.footer())
             } else {
                 CreateEmbed::new()
-                    .color(COLOR_COMPLETE)
+                    .color(presentation.color)
                     .url(GALLERY_URL)
                     .image(image_url)
             };
@@ -154,9 +249,8 @@ impl DiscordPoster {
         // overflow pages appear as plain file attachments)
         let attachments: Vec<CreateAttachment> = image_pages
             .into_iter()
-            .enumerate()
-            .map(|(i, data)| {
-                CreateAttachment::bytes(data, format!("fax_page_{}.{}", i + 1, file_ext))
+            .map(|page| {
+                CreateAttachment::bytes(page.data, fax_page_filename(page.page_number, file_ext))
             })
             .collect();
 
@@ -182,11 +276,7 @@ impl DiscordPoster {
     }
 
     /// Edit the status message to show a failure reason.
-    pub async fn edit_fax_failed(
-        &self,
-        message_id: u64,
-        reason: &str,
-    ) -> Result<(), FaxError> {
+    pub async fn edit_fax_failed(&self, message_id: u64, reason: &str) -> Result<(), FaxError> {
         let embed = CreateEmbed::new()
             .title("Fax Failed")
             .description(reason)
@@ -229,5 +319,38 @@ impl DiscordPoster {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_presentation_is_unchanged() {
+        let presentation = fax_presentation(FaxPostKind::Complete, 1, false);
+        assert_eq!(presentation.title, "Fax Received");
+        assert_eq!(presentation.description, "Fax received — 1 page");
+        assert_eq!(presentation.color, COLOR_COMPLETE);
+    }
+
+    #[test]
+    fn incomplete_presentation_is_amber_and_warns_about_missing_content() {
+        let presentation = fax_presentation(FaxPostKind::Incomplete, 2, false);
+        assert_eq!(presentation.title, "Fax Incomplete");
+        assert!(presentation.description.contains("recovered 2 pages"));
+        assert!(presentation.description.contains("content may be missing"));
+        assert_eq!(presentation.color, COLOR_INCOMPLETE);
+    }
+
+    #[test]
+    fn incomplete_presentation_reports_gallery_overflow() {
+        let presentation = fax_presentation(FaxPostKind::Incomplete, 12, true);
+        assert!(presentation.description.contains("showing first 10"));
+    }
+
+    #[test]
+    fn attachment_filename_preserves_original_page_number() {
+        assert_eq!(fax_page_filename(3, "png"), "fax_page_3.png");
     }
 }

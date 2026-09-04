@@ -8,9 +8,9 @@
 //! 5. On failure or timeout, an error message is posted to Discord
 
 use crate::fax::FaxError;
-use crate::fax::discord_poster::DiscordPoster;
+use crate::fax::discord_poster::{DiscordPoster, FaxPageAttachment};
 use crate::fax::spandsp::{FaxReceiver, FaxRxStatus, FaxT38Receiver};
-use crate::fax::tiff_decoder;
+use crate::fax::tiff_decoder::{self, DecodedFax, FaxPageCompleteness};
 use crate::services::snowflake::Snowflake;
 use crate::transport::sip::CallId;
 use std::io::Cursor;
@@ -65,6 +65,18 @@ fn timeout_reason_at(
     }
 }
 
+fn result_is_incomplete(protocol_reason: Option<&str>, decoded: &DecodedFax) -> bool {
+    protocol_reason.is_some() || decoded.is_incomplete()
+}
+
+pub(crate) fn call_end_incomplete_reason(
+    pages_received: u32,
+    document_end_signaled: bool,
+) -> Option<String> {
+    (!(pages_received > 0 && document_end_signaled))
+        .then(|| "Caller hung up before fax completed".to_string())
+}
+
 /// How the fax audio is being received
 pub enum FaxSource {
     /// G.711 audio passthrough
@@ -90,10 +102,12 @@ pub enum FaxState {
         /// Number of pages received so far
         pages_received: u32,
     },
-    /// SpanDSP signaled fax complete, awaiting conversion and Discord posting
+    /// Reception ended; the current TIFF is awaiting best-effort conversion and posting
     Received,
     /// Fax posted to Discord successfully
     Complete,
+    /// Useful fax data was posted, but the transfer or at least one page was incomplete
+    Incomplete,
     /// Fax reception failed
     Failed(String),
 }
@@ -119,6 +133,9 @@ pub struct FaxSession {
     /// Last observed progress marker, used to avoid extending the timeout for
     /// duplicate packets or timer ticks that do not advance the fax.
     last_progress: FaxProgress,
+    /// A protocol, timeout, or disconnect reason which makes an otherwise
+    /// readable TIFF an incomplete result.
+    pending_incomplete_reason: Option<String>,
     /// Discord poster for this session
     pub poster: DiscordPoster,
     /// SpanDSP fax receiver (audio or T.38 mode)
@@ -180,6 +197,7 @@ impl FaxSession {
             created_at: now,
             last_progress_at: now,
             last_progress: FaxProgress::default(),
+            pending_incomplete_reason: None,
             poster,
             receiver: FaxReceiverKind::Audio(receiver),
             tiff_dir,
@@ -189,11 +207,11 @@ impl FaxSession {
 
     /// Feed audio samples from the SIP call (16kHz mono i16).
     /// Downsamples to 8kHz and feeds to SpanDSP's fax_rx().
-    /// Returns true if the fax is complete and ready for post-processing.
+    /// Returns true when reception has ended and best-effort post-processing should run.
     /// Only works in Audio mode — logs a warning and returns false if called in T.38 mode.
     pub fn feed_audio(&mut self, samples: &[i16]) -> bool {
         if self.is_finished() {
-            return matches!(self.state, FaxState::Received | FaxState::Complete);
+            return matches!(self.state, FaxState::Received);
         }
 
         let receiver = match &mut self.receiver {
@@ -209,11 +227,11 @@ impl FaxSession {
     }
 
     /// Feed a T.38 IFP packet from the UDPTL socket to SpanDSP.
-    /// Returns true if the fax is complete and ready for post-processing.
+    /// Returns true when reception has ended and best-effort post-processing should run.
     /// Only works in T.38 mode.
     pub fn feed_t38_ifp(&mut self, data: &[u8], seq: u16) -> bool {
         if self.is_finished() {
-            return matches!(self.state, FaxState::Received | FaxState::Complete);
+            return matches!(self.state, FaxState::Received);
         }
 
         let receiver = match &mut self.receiver {
@@ -229,10 +247,10 @@ impl FaxSession {
     }
 
     /// Drive the T.38 terminal timer (call every 20ms).
-    /// Returns true if the fax is complete and ready for post-processing.
+    /// Returns true when reception has ended and best-effort post-processing should run.
     pub fn drive_t38_timer(&mut self) -> bool {
         if self.is_finished() {
-            return matches!(self.state, FaxState::Received | FaxState::Complete);
+            return matches!(self.state, FaxState::Received);
         }
 
         let receiver = match &mut self.receiver {
@@ -246,6 +264,11 @@ impl FaxSession {
 
     /// Common handler for FaxRxStatus from either audio or T.38 receiver.
     fn handle_rx_status(&mut self, status: FaxRxStatus) -> bool {
+        let incomplete_reason = match &status {
+            FaxRxStatus::Error(message) => Some(message.clone()),
+            FaxRxStatus::Complete | FaxRxStatus::InProgress => None,
+        };
+
         // Log stats on completion/error before delegating to pure state transition
         match &status {
             FaxRxStatus::Complete => {
@@ -298,7 +321,11 @@ impl FaxSession {
                 .unwrap_or(0),
         };
         self.observe_progress(progress);
-        apply_rx_status(&mut self.state, status, page_count)
+        let ready_to_post = apply_rx_status(&mut self.state, status, page_count);
+        if ready_to_post {
+            self.pending_incomplete_reason = incomplete_reason;
+        }
+        ready_to_post
     }
 
     fn negotiation_started(&self) -> bool {
@@ -335,6 +362,16 @@ impl FaxSession {
         }
     }
 
+    /// Whether the sender marked the most recently received page as the end of
+    /// the document. A call ending after this signal is normally successful
+    /// even if the final phase-E callback did not arrive.
+    pub(crate) fn document_end_signaled(&self) -> bool {
+        match &self.receiver {
+            FaxReceiverKind::Audio(r) => r.document_end_signaled(),
+            FaxReceiverKind::T38(r) => r.document_end_signaled(),
+        }
+    }
+
     /// Get transfer statistics from SpanDSP.
     fn get_stats(&self) -> Option<crate::fax::spandsp::FaxStats> {
         match &self.receiver {
@@ -352,8 +389,45 @@ impl FaxSession {
     pub fn is_finished(&self) -> bool {
         matches!(
             self.state,
-            FaxState::Received | FaxState::Complete | FaxState::Failed(_)
+            FaxState::Received | FaxState::Complete | FaxState::Incomplete | FaxState::Failed(_)
         )
+    }
+
+    /// Whether TIFF conversion and Discord posting are still required.
+    pub(crate) fn is_ready_to_post(&self) -> bool {
+        matches!(self.state, FaxState::Received)
+    }
+
+    /// Whether a final Discord result has already been posted (or posting
+    /// itself failed), making further recovery attempts a no-op.
+    pub(crate) fn is_result_posted(&self) -> bool {
+        matches!(
+            self.state,
+            FaxState::Complete | FaxState::Incomplete | FaxState::Failed(_)
+        )
+    }
+
+    /// Stop reception and make the current TIFF ready for best-effort
+    /// post-processing. `None` means the protocol reached a clean ending.
+    pub(crate) fn finish_reception(&mut self, incomplete_reason: Option<String>) {
+        if self.is_result_posted() {
+            return;
+        }
+
+        let terminate_result = match &mut self.receiver {
+            FaxReceiverKind::Audio(receiver) => receiver.terminate_reception(),
+            FaxReceiverKind::T38(receiver) => receiver.terminate_reception(),
+        };
+        if let Err(error) = terminate_result {
+            warn!(
+                call_id = %self.call_id,
+                error = ?error,
+                "Failed to terminate SpanDSP reception cleanly before recovery"
+            );
+        }
+
+        self.pending_incomplete_reason = incomplete_reason;
+        self.state = FaxState::Received;
     }
 
     /// Post the initial "Receiving fax..." message to Discord.
@@ -396,12 +470,11 @@ impl FaxSession {
     }
 
     /// Convert the received TIFF to images and post to Discord.
-    /// Called after fax reception is complete.
+    /// Called after fax reception ends, successfully or otherwise.
     pub async fn convert_and_post(&mut self) -> Result<(), FaxError> {
-        // Guard against double-processing: if we've already posted (Complete) or failed,
-        // another caller (e.g., CallEnded racing with T.38 completion) already handled it.
-        // Note: FaxState::Received is NOT skipped — that's the normal entry state.
-        if matches!(self.state, FaxState::Complete | FaxState::Failed(_)) {
+        // The session mutex serializes callers; the posted states make racing
+        // completion, timeout, and CallEnded paths idempotent.
+        if self.is_result_posted() {
             debug!(
                 "convert_and_post called on already-finished session {} — skipping",
                 self.call_id
@@ -435,78 +508,142 @@ impl FaxSession {
             pages
         );
 
-        let gray_images = match tiff_decoder::decode_fax_tiff(tiff_path) {
-            Ok(images) => images,
-            Err(error @ FaxError::CorruptPageData(_)) => {
+        let decoded = match tiff_decoder::decode_fax_tiff_with_report(tiff_path) {
+            Ok(decoded) => decoded,
+            Err(error) => {
                 warn!(
                     call_id = %self.call_id,
                     error = ?error,
-                    "Rejecting corrupt/incomplete fax page data"
+                    "No useful fax page data could be recovered"
                 );
-                let user_message = error.to_string();
-                self.post_failure(&user_message).await;
-
-                // The failure has been reported. Returning Ok prevents the
-                // caller from replacing the specific message with its generic
-                // conversion-failure fallback.
-                return Ok(());
+                let user_message =
+                    self.pending_incomplete_reason
+                        .clone()
+                        .or_else(|| match &error {
+                            FaxError::CorruptPageData(_) => Some(error.to_string()),
+                            FaxError::NoPages => Some("No pages in received fax".to_string()),
+                            _ => None,
+                        });
+                if let Some(user_message) = user_message {
+                    self.post_failure(&user_message).await;
+                    // The failure has already been reported; do not let callers
+                    // replace it with their generic conversion fallback.
+                    return Ok(());
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
         };
-        let image_pages: Vec<Vec<u8>> = gray_images
+
+        let partial_page_count = decoded
+            .pages
+            .iter()
+            .filter(|page| matches!(page.completeness, FaxPageCompleteness::Partial { .. }))
+            .count();
+        let omitted_page_count = decoded.omitted_pages.len();
+        let is_incomplete =
+            result_is_incomplete(self.pending_incomplete_reason.as_deref(), &decoded);
+
+        for page in &decoded.pages {
+            if let FaxPageCompleteness::Partial {
+                decoded_rows,
+                declared_rows,
+            } = page.completeness
+            {
+                warn!(
+                    call_id = %self.call_id,
+                    page = page.page_number,
+                    decoded_rows,
+                    declared_rows,
+                    "Recovering partial fax page"
+                );
+            }
+        }
+        for page in &decoded.omitted_pages {
+            warn!(
+                call_id = %self.call_id,
+                page = page.page_number,
+                reason = %page.reason,
+                "Omitting unusable fax page"
+            );
+        }
+
+        let image_pages: Vec<FaxPageAttachment> = decoded
+            .pages
             .into_iter()
-            .map(|img| {
+            .map(|page| {
                 let mut buf = Vec::new();
-                image::DynamicImage::ImageLuma8(img)
+                image::DynamicImage::ImageLuma8(page.image)
                     .write_to(&mut Cursor::new(&mut buf), output_format.image_format())
-                    .map(|_| buf)
+                    .map(|_| FaxPageAttachment {
+                        page_number: page.page_number,
+                        data: buf,
+                    })
             })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| FaxError::Tiff(format!("image encode: {e}")))?;
 
         if image_pages.is_empty() {
             self.post_failure("No pages in received fax").await;
-            return Err(FaxError::NoPages);
+            return Ok(());
         }
 
         let page_count = image_pages.len() as u32;
 
-        if let Some(discord_msg_id) = self.receiving_message_id {
-            match self
-                .poster
-                .edit_fax_complete(discord_msg_id, image_pages, page_count, file_ext)
-                .await
-            {
-                Ok(()) => {
-                    info!(
-                        "Fax complete: {} pages posted to channel {} (call {})",
-                        page_count, self.text_channel_id, self.call_id
-                    );
-                    self.state = FaxState::Complete;
-                }
-                Err(e) => {
-                    error!("Failed to post completed fax: {}", e);
-                    self.state = FaxState::Failed(format!("Discord upload error: {}", e));
-                    return Err(e);
-                }
-            }
-        } else {
+        if self.receiving_message_id.is_none() {
             // If we never posted a "receiving" message (e.g., fast fax), post directly
-            // This shouldn't normally happen since we post receiving message early
-            warn!("Fax completed without a receiving message — posting directly");
+            warn!("Fax ended without a receiving message — posting directly");
             match self.poster.post_fax_receiving().await {
                 Ok(msg_id) => {
                     self.receiving_message_id = Some(msg_id);
-                    self.poster
-                        .edit_fax_complete(msg_id, image_pages, page_count, file_ext)
-                        .await?;
-                    self.state = FaxState::Complete;
                 }
                 Err(e) => {
                     error!("Failed to post fax: {}", e);
                     self.state = FaxState::Failed(format!("Discord error: {}", e));
                     return Err(e);
                 }
+            }
+        }
+
+        let Some(discord_msg_id) = self.receiving_message_id else {
+            return Err(FaxError::Tiff(
+                "missing Discord status message before fax result edit".to_string(),
+            ));
+        };
+        let post_result = if is_incomplete {
+            self.poster
+                .edit_fax_incomplete(discord_msg_id, image_pages, file_ext)
+                .await
+        } else {
+            let image_data = image_pages.into_iter().map(|page| page.data).collect();
+            self.poster
+                .edit_fax_complete(discord_msg_id, image_data, page_count, file_ext)
+                .await
+        };
+
+        match post_result {
+            Ok(()) => {
+                if is_incomplete {
+                    warn!(
+                        "Fax incomplete: {} recovered page(s), {} partial, {} omitted; posted to channel {} (call {})",
+                        page_count,
+                        partial_page_count,
+                        omitted_page_count,
+                        self.text_channel_id,
+                        self.call_id
+                    );
+                    self.state = FaxState::Incomplete;
+                } else {
+                    info!(
+                        "Fax complete: {} pages posted to channel {} (call {})",
+                        page_count, self.text_channel_id, self.call_id
+                    );
+                    self.state = FaxState::Complete;
+                }
+            }
+            Err(e) => {
+                error!("Failed to post fax result: {}", e);
+                self.state = FaxState::Failed(format!("Discord upload error: {}", e));
+                return Err(e);
             }
         }
 
@@ -555,6 +692,7 @@ impl Drop for FaxSession {
             FaxState::Receiving { .. } => "receiving",
             FaxState::Received => "received",
             FaxState::Complete => "complete",
+            FaxState::Incomplete => "incomplete",
             FaxState::Failed(reason) => {
                 debug!("Fax failure reason: {}", reason);
                 "failed"
@@ -584,9 +722,17 @@ impl Drop for FaxSession {
 
 // Pure state transition logic (extracted for testability)
 
-/// Apply a FaxRxStatus to a FaxState, returning whether the fax is complete.
+/// Apply a FaxRxStatus to a FaxState, returning whether reception has ended and
+/// best-effort post-processing should run.
 /// This is the core state transition logic used by `FaxSession::handle_rx_status`.
 fn apply_rx_status(state: &mut FaxState, status: FaxRxStatus, page_count: u32) -> bool {
+    if matches!(
+        state,
+        FaxState::Complete | FaxState::Incomplete | FaxState::Failed(_)
+    ) {
+        return false;
+    }
+
     match status {
         FaxRxStatus::InProgress => {
             if let FaxState::Receiving { pages_received, .. } = state {
@@ -598,9 +744,11 @@ fn apply_rx_status(state: &mut FaxState, status: FaxRxStatus, page_count: u32) -
             *state = FaxState::Received;
             true
         }
-        FaxRxStatus::Error(msg) => {
-            *state = FaxState::Failed(msg);
-            false
+        FaxRxStatus::Error(_) => {
+            // Protocol failures may still have useful TIFF pages. Mark the
+            // receiver ready so the common finalization path can recover them.
+            *state = FaxState::Received;
+            true
         }
     }
 }
@@ -637,7 +785,7 @@ mod tests {
     fn state_is_finished(state: &FaxState) -> bool {
         matches!(
             state,
-            FaxState::Received | FaxState::Complete | FaxState::Failed(_)
+            FaxState::Received | FaxState::Complete | FaxState::Incomplete | FaxState::Failed(_)
         )
     }
 
@@ -666,8 +814,48 @@ mod tests {
     }
 
     #[test]
+    fn is_finished_incomplete() {
+        assert!(state_is_finished(&FaxState::Incomplete));
+    }
+
+    #[test]
     fn is_finished_failed() {
         assert!(state_is_finished(&FaxState::Failed("err".to_string())));
+    }
+
+    #[test]
+    fn result_outcome_combines_protocol_and_decoder_completeness() {
+        let mut decoded = DecodedFax {
+            pages: vec![tiff_decoder::DecodedFaxPage {
+                page_number: 1,
+                image: image::GrayImage::new(1, 1),
+                completeness: FaxPageCompleteness::Complete,
+            }],
+            omitted_pages: Vec::new(),
+        };
+
+        assert!(!result_is_incomplete(None, &decoded));
+        assert!(result_is_incomplete(Some("carrier lost"), &decoded));
+
+        decoded.pages[0].completeness = FaxPageCompleteness::Partial {
+            decoded_rows: 1100,
+            declared_rows: 2200,
+        };
+        assert!(result_is_incomplete(None, &decoded));
+
+        decoded.pages[0].completeness = FaxPageCompleteness::Complete;
+        decoded.omitted_pages.push(tiff_decoder::OmittedFaxPage {
+            page_number: 2,
+            reason: "too short".to_string(),
+        });
+        assert!(result_is_incomplete(None, &decoded));
+    }
+
+    #[test]
+    fn call_end_after_eop_is_clean_but_other_disconnects_are_incomplete() {
+        assert_eq!(call_end_incomplete_reason(1, true), None);
+        assert!(call_end_incomplete_reason(1, false).is_some());
+        assert!(call_end_incomplete_reason(0, true).is_some());
     }
 
     // Timeout policy tests
@@ -796,14 +984,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_rx_status_error_transitions_to_failed() {
+    fn apply_rx_status_error_transitions_to_recoverable_received() {
         let mut state = FaxState::WaitingForData;
         let result = apply_rx_status(&mut state, FaxRxStatus::Error("timeout".to_string()), 0);
-        assert!(!result);
-        match state {
-            FaxState::Failed(msg) => assert_eq!(msg, "timeout"),
-            _ => panic!("Expected Failed state"),
-        }
+        assert!(result);
+        assert!(matches!(state, FaxState::Received));
     }
 
     #[test]
