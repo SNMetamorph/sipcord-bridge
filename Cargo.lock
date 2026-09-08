@@ -3747,7 +3747,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sipcord-bridge"
-version = "2.1.13"
+version = "2.1.14"
 dependencies = [
  "async-trait",
  "audioadapter",
@@ -3886,9 +3886,9 @@ dependencies = [
 
 [[package]]
 name = "spandsp"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dff2ad1c0d8ff44bf40d03ad314c0dc6895f843868ec6cc3719189055902b628"
+checksum = "562fba2c8701225d15903361f21e82ad8e44dc54c6b405c113ec2e9063ab2a0b"
 dependencies = [
  "bitflags 2.11.0",
  "spandsp-sys",
@@ -3897,9 +3897,9 @@ dependencies = [
 
 [[package]]
 name = "spandsp-sys"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc14bd05d640cd3e7347ed5ba83dbcf50dd9ed82a626a87fe38c15ca25d6724"
+checksum = "3f1c024f1388574ec060af2e1eba7351185a6022c0fa48e5ddc68e2d981a83b2"
 dependencies = [
  "bindgen 0.72.1",
  "cc",

@@ -70,7 +70,7 @@ claxon = "0.4.3"
 pjsua = { path = "../pjsua" }
 
 # SpanDSP - fax demodulation
-spandsp = "0.2.0"
+spandsp = "0.2.1"
 
 # UDPTL transport for T.38 fax
 udptl = "0.2.0"
