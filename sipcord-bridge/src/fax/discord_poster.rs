@@ -15,6 +15,7 @@ use serenity::builder::{
 use serenity::http::Http;
 use serenity::secrets::Token;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, warn};
 
 const COLOR_RECEIVING: u32 = 0x5865F2; // Discord blurple
@@ -22,6 +23,28 @@ const COLOR_COMPLETE: u32 = 0x57F287; // Green
 const COLOR_INCOMPLETE: u32 = 0xF0B232; // Amber
 const COLOR_FAILED: u32 = 0xED4245; // Red
 const GALLERY_URL: &str = "https://sipcord.net/fax";
+pub(crate) const MAX_FAX_PAGES: usize = 10;
+const UPLOAD_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+
+/// Retry the same message edit twice. Replacing attachments makes an uncertain
+/// response safe to retry without appending duplicate pages or messages.
+async fn retry_upload<F, Fut, T, E>(mut upload: F, delays: [Duration; 2]) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    for delay in delays {
+        match upload().await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                warn!(%error, retry_delay_secs = delay.as_secs(), "Fax upload failed; retrying")
+            }
+        }
+        tokio::time::sleep(delay).await;
+    }
+    upload().await
+}
 
 /// An encoded page ready to attach to Discord. `page_number` is the original
 /// TIFF page number, so gaps remain visible when an unreadable page is omitted.
@@ -48,7 +71,9 @@ fn fax_presentation(kind: FaxPostKind, page_count: u32, has_overflow: bool) -> F
             let description = if page_count == 1 {
                 "Fax received — 1 page".to_string()
             } else if has_overflow {
-                format!("Fax received — {page_count} pages (showing first 10)")
+                format!(
+                    "Fax received — {page_count} pages. First 10 pages shown; remaining pages truncated."
+                )
             } else {
                 format!("Fax received — {page_count} pages")
             };
@@ -61,7 +86,7 @@ fn fax_presentation(kind: FaxPostKind, page_count: u32, has_overflow: bool) -> F
         FaxPostKind::Incomplete => {
             let pages = if page_count == 1 { "page" } else { "pages" };
             let overflow = if has_overflow {
-                " (showing first 10)"
+                ". First 10 pages shown; remaining pages truncated"
             } else {
                 ""
             };
@@ -79,6 +104,57 @@ fn fax_presentation(kind: FaxPostKind, page_count: u32, has_overflow: bool) -> F
 
 fn fax_page_filename(page_number: usize, file_ext: &str) -> String {
     format!("fax_page_{page_number}.{file_ext}")
+}
+
+fn fax_result_edit<'a>(
+    image_pages: Vec<FaxPageAttachment>,
+    page_count: u32,
+    file_ext: &str,
+    kind: FaxPostKind,
+    footer: CreateEmbedFooter<'a>,
+) -> EditMessage<'a> {
+    let embed_count = image_pages.len().min(MAX_FAX_PAGES);
+    let has_overflow = page_count as usize > MAX_FAX_PAGES;
+    let presentation = fax_presentation(kind, page_count, has_overflow);
+
+    // One embed per page (up to MAX_FAX_PAGES) with a shared URL for gallery rendering
+    let mut embeds = Vec::with_capacity(embed_count);
+    for (index, page) in image_pages.iter().take(embed_count).enumerate() {
+        let filename = fax_page_filename(page.page_number, file_ext);
+        let image_url = format!("attachment://{}", filename);
+
+        let embed = if index == 0 {
+            CreateEmbed::new()
+                .title(presentation.title)
+                .description(presentation.description.clone())
+                .color(presentation.color)
+                .url(GALLERY_URL)
+                .image(image_url)
+                .footer(footer.clone())
+        } else {
+            CreateEmbed::new()
+                .color(presentation.color)
+                .url(GALLERY_URL)
+                .image(image_url)
+        };
+        embeds.push(embed);
+    }
+
+    // The attachment limit applies independently of the embed limit.
+    let attachments: Vec<CreateAttachment> = image_pages
+        .into_iter()
+        .take(MAX_FAX_PAGES)
+        .map(|page| {
+            CreateAttachment::bytes(page.data, fax_page_filename(page.page_number, file_ext))
+        })
+        .collect();
+
+    let mut edit = EditMessage::new().remove_all_attachments().embeds(embeds);
+    for attachment in attachments {
+        edit = edit.new_attachment(attachment);
+    }
+
+    edit
 }
 
 pub struct DiscordPoster {
@@ -157,12 +233,11 @@ impl DiscordPoster {
 
     /// Replace the "Receiving fax..." message with the completed fax and image attachments.
     ///
-    /// Deletes the original status message and posts a new one with embeds + images.
+    /// Edits the original status message with embeds and images.
     /// Uses one embed per page with a shared URL so Discord renders them as a gallery.
     /// `file_ext` is the file extension without dot (e.g. "png" or "jpg").
     ///
-    /// Discord limits messages to 10 embeds. For faxes with >10 pages, the first 10
-    /// pages are shown in the embed gallery, and remaining pages are attached as files.
+    /// At most 10 pages are attached, with an explicit notice when more were received.
     pub async fn edit_fax_complete(
         &self,
         message_id: u64,
@@ -188,15 +263,15 @@ impl DiscordPoster {
         .await
     }
 
-    /// Replace the status message with every useful page recovered from an
-    /// incomplete transfer.
+    /// Replace the status message with the first 10 useful pages recovered from
+    /// an incomplete transfer, reporting the total recovered count.
     pub(crate) async fn edit_fax_incomplete(
         &self,
         message_id: u64,
         image_pages: Vec<FaxPageAttachment>,
+        page_count: u32,
         file_ext: &str,
     ) -> Result<(), FaxError> {
-        let page_count = image_pages.len() as u32;
         self.edit_fax_result(
             message_id,
             image_pages,
@@ -215,58 +290,22 @@ impl DiscordPoster {
         file_ext: &str,
         kind: FaxPostKind,
     ) -> Result<(), FaxError> {
-        /// Discord's maximum number of embeds per message.
-        const MAX_EMBEDS: u32 = 10;
+        let edit = fax_result_edit(image_pages, page_count, file_ext, kind, self.footer());
 
-        let embed_count = page_count.min(MAX_EMBEDS);
-        let has_overflow = page_count > MAX_EMBEDS;
-        let presentation = fax_presentation(kind, page_count, has_overflow);
-
-        // One embed per page (up to MAX_EMBEDS) with a shared URL for gallery rendering
-        let mut embeds = Vec::with_capacity(embed_count as usize);
-        for (index, page) in image_pages.iter().take(embed_count as usize).enumerate() {
-            let filename = fax_page_filename(page.page_number, file_ext);
-            let image_url = format!("attachment://{}", filename);
-
-            let embed = if index == 0 {
-                CreateEmbed::new()
-                    .title(presentation.title)
-                    .description(presentation.description.clone())
-                    .color(presentation.color)
-                    .url(GALLERY_URL)
-                    .image(image_url)
-                    .footer(self.footer())
-            } else {
-                CreateEmbed::new()
-                    .color(presentation.color)
-                    .url(GALLERY_URL)
-                    .image(image_url)
-            };
-            embeds.push(embed);
-        }
-
-        // All pages are attached as files (embed pages get rendered in gallery,
-        // overflow pages appear as plain file attachments)
-        let attachments: Vec<CreateAttachment> = image_pages
-            .into_iter()
-            .map(|page| {
-                CreateAttachment::bytes(page.data, fax_page_filename(page.page_number, file_ext))
-            })
-            .collect();
-
-        let mut edit = EditMessage::new().embeds(embeds);
-        for attachment in attachments {
-            edit = edit.new_attachment(attachment);
-        }
-
-        if let Err(e) = self
-            .channel_id
-            .widen()
-            .edit_message(&self.http, MessageId::new(message_id), edit)
-            .await
+        if let Err(e) = retry_upload(
+            || {
+                self.channel_id.widen().edit_message(
+                    &self.http,
+                    MessageId::new(message_id),
+                    edit.clone(),
+                )
+            },
+            UPLOAD_RETRY_DELAYS,
+        )
+        .await
         {
             error!(
-                "Discord API error editing fax complete (msg={}, {} pages): {}",
+                "Fax upload failed after 3 attempts (msg={}, {} received pages): {}",
                 message_id, page_count, e
             );
             return Err(FaxError::Discord(e));
@@ -326,6 +365,90 @@ impl DiscordPoster {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn upload_retries_twice_and_stops_on_success() {
+        for failures in [0, 1, 2, 3] {
+            let mut attempts = 0;
+            let result = retry_upload(
+                || {
+                    attempts += 1;
+                    std::future::ready(if attempts <= failures {
+                        Err("upload rejected")
+                    } else {
+                        Ok(())
+                    })
+                },
+                [Duration::ZERO; 2],
+            )
+            .await;
+            assert_eq!(attempts, (failures + 1).min(3));
+            assert_eq!(result.is_err(), failures == 3);
+        }
+    }
+
+    #[test]
+    fn result_payload_caps_attachments_and_embeds_and_reports_total() {
+        for kind in [FaxPostKind::Complete, FaxPostKind::Incomplete] {
+            for count in [1, 10, 11, 49] {
+                let pages = (1..=count)
+                    .map(|page_number| FaxPageAttachment {
+                        page_number,
+                        data: vec![42],
+                    })
+                    .collect();
+                let edit = fax_result_edit(
+                    pages,
+                    count as u32,
+                    "png",
+                    kind,
+                    CreateEmbedFooter::new("From: test"),
+                );
+                let payload = serde_json::to_value(edit).unwrap();
+                let attachments = payload["attachments"].as_array().unwrap();
+                let embeds = payload["embeds"].as_array().unwrap();
+                assert_eq!(attachments.len(), count.min(10));
+                assert_eq!(embeds.len(), count.min(10));
+                for (index, attachment) in attachments.iter().enumerate() {
+                    assert_eq!(
+                        attachment["filename"],
+                        format!("fax_page_{}.png", index + 1)
+                    );
+                    assert_eq!(
+                        embeds[index]["image"]["url"],
+                        format!("attachment://fax_page_{}.png", index + 1)
+                    );
+                }
+                let description = embeds[0]["description"].as_str().unwrap();
+                assert!(description.contains(&format!("{count} page")));
+                assert_eq!(
+                    description.contains("First 10 pages shown; remaining pages truncated"),
+                    count > 10
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn already_capped_pages_still_report_total_received() {
+        let pages = (1..=10)
+            .map(|page_number| FaxPageAttachment {
+                page_number,
+                data: vec![42],
+            })
+            .collect();
+        let payload = serde_json::to_value(fax_result_edit(
+            pages,
+            49,
+            "png",
+            FaxPostKind::Incomplete,
+            CreateEmbedFooter::new("From: test"),
+        ))
+        .unwrap();
+        let description = payload["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.contains("recovered 49 pages"));
+        assert!(description.contains("remaining pages truncated"));
+    }
+
     #[test]
     fn complete_presentation_is_unchanged() {
         let presentation = fax_presentation(FaxPostKind::Complete, 1, false);
@@ -346,7 +469,11 @@ mod tests {
     #[test]
     fn incomplete_presentation_reports_gallery_overflow() {
         let presentation = fax_presentation(FaxPostKind::Incomplete, 12, true);
-        assert!(presentation.description.contains("showing first 10"));
+        assert!(
+            presentation
+                .description
+                .contains("First 10 pages shown; remaining pages truncated")
+        );
     }
 
     #[test]

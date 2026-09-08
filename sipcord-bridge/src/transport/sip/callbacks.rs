@@ -64,6 +64,62 @@ static OUTBOUND_EVENT_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender
 pub static T38_PRESOCKETS: std::sync::LazyLock<DashMap<i32, std::net::UdpSocket>> =
     std::sync::LazyLock::new(DashMap::new);
 
+static FAX_AUDIO_CALLS: std::sync::LazyLock<dashmap::DashSet<i32>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
+
+pub(super) fn mark_fax_audio_call(call_id: CallId) {
+    FAX_AUDIO_CALLS.insert(*call_id);
+}
+
+fn configure_fax_codec(param: &mut pjmedia_codec_param) {
+    // Send silence too; speech concealment cannot reconstruct modem symbols.
+    param.setting.set_vad(0);
+    param.setting.set_plc(0);
+}
+
+/// Speech-oriented progressive discard intentionally skips received frames to
+/// reduce latency. Fax modems need a continuous waveform instead. Set this
+/// before stream creation, including streams recreated by re-INVITEs.
+pub unsafe extern "C" fn on_stream_precreate_cb(
+    raw_call_id: pjsua_call_id,
+    param: *mut pjsua_on_stream_precreate_param,
+) {
+    if !FAX_AUDIO_CALLS.contains(&raw_call_id) || param.is_null() {
+        return;
+    }
+    unsafe {
+        let param = &mut *param;
+        if param.stream_info.type_ != pjmedia_type_PJMEDIA_TYPE_AUDIO {
+            return;
+        }
+        let audio = &mut param.stream_info.info.aud;
+        // Fixed 200 ms prefetch; allow up to a second of buffered audio for
+        // bursts/clock drift, without the speech latency discard policy.
+        audio.jb_init = 200;
+        audio.jb_min_pre = 200;
+        audio.jb_max_pre = 200;
+        audio.jb_max = 1000;
+        audio.jb_discard_algo = pjmedia_jb_discard_algo_PJMEDIA_JB_DISCARD_NONE;
+        // In the bundled PJSIP, stream_info_from_sdp allocates these codec
+        // parameters per stream. pjsua_aud_channel_update passes a shallow
+        // copy here, so modify the pointed-to parameters before stream_create
+        // copies them. A runtime codec_modify alone would be undone when the
+        // stream's initial VAD suspension expires (also restoring speech PLC).
+        if let Some(codec) = audio.param.as_mut() {
+            configure_fax_codec(codec);
+        } else {
+            tracing::warn!(
+                raw_call_id,
+                "Fax stream has no codec parameters; cannot disable VAD/PLC"
+            );
+        }
+        tracing::info!(
+            raw_call_id,
+            "Configured fax audio jitter buffer without progressive discard"
+        );
+    }
+}
+
 /// Set the outbound event sender (called from main.rs)
 pub fn set_outbound_event_sender(tx: tokio::sync::mpsc::UnboundedSender<super::SipEvent>) {
     let _ = OUTBOUND_EVENT_TX.set(tx);
@@ -314,6 +370,8 @@ pub unsafe extern "C" fn on_incoming_call_cb(
     raw_call_id: pjsua_call_id,
     rdata: *mut pjsip_rx_data,
 ) {
+    // PJSUA reuses numeric call IDs.
+    FAX_AUDIO_CALLS.remove(&raw_call_id);
     unsafe {
         let call_id = CallId::new(raw_call_id);
         let mut ci = MaybeUninit::<pjsua_call_info>::uninit();
@@ -609,6 +667,7 @@ pub unsafe extern "C" fn on_call_state_cb(raw_call_id: pjsua_call_id, _e: *mut p
 
         // Check if call ended
         if ci.state == pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED {
+            FAX_AUDIO_CALLS.remove(&raw_call_id);
             // Clean up audio buffer
             if let Some(buffers) = AUDIO_OUT_BUFFERS.get() {
                 buffers.remove(&call_id);
@@ -708,13 +767,9 @@ pub unsafe extern "C" fn on_call_media_state_cb(raw_call_id: pjsua_call_id) {
                 let si = stream_info.assume_init();
                 // si.info is a union, for audio it's pjmedia_stream_info
                 let audio_info = si.info.aud;
-                let codec_name = std::ffi::CStr::from_ptr(
-                    audio_info.fmt.encoding_name.ptr as *const std::ffi::c_char,
-                )
-                .to_string_lossy();
+                let codec_name = pj_str_to_string(&audio_info.fmt.encoding_name);
                 let clock_rate = audio_info.fmt.clock_rate;
                 let channel_cnt = audio_info.fmt.channel_cnt;
-                // Get ptime from the param field (need to dereference pointer)
                 let param = &*audio_info.param;
                 let ptime = param.setting.frm_per_pkt as u32 * param.info.frm_ptime as u32;
                 format!(
@@ -1489,6 +1544,75 @@ unsafe fn strip_hold_from_neg_remote(call_id: CallId, rdata: *mut pjsip_rx_data)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fax_stream_policy_preserves_audio_without_changing_voice_or_video() {
+        let fax_id = -9001;
+        let voice_id = -9002;
+        let mut param: pjsua_on_stream_precreate_param = unsafe { std::mem::zeroed() };
+        let mut codec: pjmedia_codec_param = unsafe { std::mem::zeroed() };
+        codec.setting.set_vad(1);
+        codec.setting.set_plc(1);
+        param.stream_info.type_ = pjmedia_type_PJMEDIA_TYPE_AUDIO;
+        unsafe {
+            let audio = &mut param.stream_info.info.aud;
+            audio.jb_init = -1;
+            audio.jb_min_pre = -1;
+            audio.jb_max_pre = -1;
+            audio.jb_max = -1;
+            audio.jb_discard_algo = pjmedia_jb_discard_algo_PJMEDIA_JB_DISCARD_PROGRESSIVE;
+            audio.fmt.clock_rate = 8000;
+            audio.rx_pt = 8;
+            audio.param = &mut codec;
+            on_stream_precreate_cb(voice_id, &mut param);
+            assert_eq!((codec.setting.vad(), codec.setting.plc()), (1, 1));
+            assert_eq!(param.stream_info.info.aud.jb_init, -1);
+            assert_eq!(
+                param.stream_info.info.aud.jb_discard_algo,
+                pjmedia_jb_discard_algo_PJMEDIA_JB_DISCARD_PROGRESSIVE
+            );
+
+            mark_fax_audio_call(CallId::new(fax_id));
+            on_stream_precreate_cb(fax_id, std::ptr::null_mut());
+            param.stream_info.type_ = pjmedia_type_PJMEDIA_TYPE_VIDEO;
+            on_stream_precreate_cb(fax_id, &mut param);
+            assert_eq!(param.stream_info.info.aud.jb_init, -1);
+            param.stream_info.type_ = pjmedia_type_PJMEDIA_TYPE_AUDIO;
+            on_stream_precreate_cb(fax_id, &mut param);
+            let audio = &param.stream_info.info.aud;
+            assert_eq!(
+                (
+                    audio.jb_init,
+                    audio.jb_min_pre,
+                    audio.jb_max_pre,
+                    audio.jb_max
+                ),
+                (200, 200, 200, 1000)
+            );
+            assert_eq!(
+                audio.jb_discard_algo,
+                pjmedia_jb_discard_algo_PJMEDIA_JB_DISCARD_NONE
+            );
+            assert_eq!((audio.fmt.clock_rate, audio.rx_pt), (8000, 8));
+            assert_eq!((codec.setting.vad(), codec.setting.plc()), (0, 0));
+            assert_eq!(audio.param, &mut codec as *mut _);
+            FAX_AUDIO_CALLS.remove(&fax_id);
+        }
+    }
+
+    #[test]
+    fn fax_codec_disables_speech_processing_and_preserves_packetization() {
+        let mut param: pjmedia_codec_param = unsafe { std::mem::zeroed() };
+        param.setting.set_vad(1);
+        param.setting.set_plc(1);
+        param.setting.frm_per_pkt = 2;
+        param.info.frm_ptime = 10;
+        configure_fax_codec(&mut param);
+        assert_eq!(param.setting.vad(), 0);
+        assert_eq!(param.setting.plc(), 0);
+        assert_eq!(param.setting.frm_per_pkt, 2);
+        assert_eq!(param.info.frm_ptime, 10);
+    }
 
     #[test]
     fn only_ringing_provisional_responses_advance_the_call() {

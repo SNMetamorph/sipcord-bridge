@@ -117,6 +117,8 @@ pub enum SipCommand {
     Hangup { call_id: CallId },
     /// Answer a call with 200 OK (after Discord connects successfully)
     Answer { call_id: CallId },
+    /// Configure fax audio before answering, while on the SIP command thread.
+    AnswerFax { call_id: CallId },
     /// Send 183 Session Progress (establishes early media for connecting sound)
     Send183 { call_id: CallId },
     /// Start streaming audio from a file to a call (for large files like easter eggs)
@@ -403,6 +405,10 @@ fn process_sip_command(
             hangup_call(call_id);
         }
         SipCommand::Answer { call_id } => {
+            answer_call(call_id);
+        }
+        SipCommand::AnswerFax { call_id } => {
+            callbacks::mark_fax_audio_call(call_id);
             answer_call(call_id);
         }
         SipCommand::Send183 { call_id } => {

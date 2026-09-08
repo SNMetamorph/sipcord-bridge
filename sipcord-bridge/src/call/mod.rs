@@ -2297,7 +2297,7 @@ async fn handle_incoming_call(
 
             // Answer the call to establish the audio path. The session is
             // already discoverable if the answer triggers a fast re-INVITE.
-            if sip_cmd_tx.send(SipCommand::Answer { call_id }).is_err() {
+            if sip_cmd_tx.send(SipCommand::AnswerFax { call_id }).is_err() {
                 error!("Failed to queue Answer for fax call {}", call_id);
                 remove_fax_session_if_current(
                     &fax_sessions,

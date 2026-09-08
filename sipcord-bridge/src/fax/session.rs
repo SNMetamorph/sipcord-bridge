@@ -8,7 +8,7 @@
 //! 5. On failure or timeout, an error message is posted to Discord
 
 use crate::fax::FaxError;
-use crate::fax::discord_poster::{DiscordPoster, FaxPageAttachment};
+use crate::fax::discord_poster::{DiscordPoster, FaxPageAttachment, MAX_FAX_PAGES};
 use crate::fax::spandsp::{FaxReceiver, FaxRxStatus, FaxT38Receiver};
 use crate::fax::tiff_decoder::{self, DecodedFax, FaxPageCompleteness};
 use crate::services::snowflake::Snowflake;
@@ -26,7 +26,7 @@ const FAX_INACTIVITY_TIMEOUT_SECS: u64 = 300;
 /// Absolute safety limit for a fax session, even while it continues to make
 /// progress. This keeps pathological sessions bounded while allowing normal
 /// multi-page faxes to run well beyond five minutes.
-const FAX_SESSION_LIMIT_SECS: u64 = 30 * 60;
+const FAX_SESSION_LIMIT_SECS: u64 = 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FaxTimeoutReason {
@@ -175,6 +175,8 @@ pub struct FaxSession {
     /// Discord message ID for the "Receiving fax..." status message.
     /// Stored separately so it survives state transitions to Complete/Failed.
     receiving_message_id: Option<u64>,
+    /// Keep the source TIFF if copying a failed delivery into durable storage fails.
+    retain_temp_files: bool,
 }
 
 impl FaxSession {
@@ -233,6 +235,7 @@ impl FaxSession {
             receiver: FaxReceiverKind::Audio(receiver),
             tiff_dir,
             receiving_message_id: None,
+            retain_temp_files: false,
         })
     }
 
@@ -646,9 +649,11 @@ impl FaxSession {
             );
         }
 
+        let page_count = decoded.pages.len() as u32;
         let image_pages: Vec<FaxPageAttachment> = decoded
             .pages
             .into_iter()
+            .take(MAX_FAX_PAGES)
             .map(|page| {
                 let mut buf = Vec::new();
                 image::DynamicImage::ImageLuma8(page.image)
@@ -666,8 +671,6 @@ impl FaxSession {
             return Ok(());
         }
 
-        let page_count = image_pages.len() as u32;
-
         if self.receiving_message_id.is_none() {
             // If we never posted a "receiving" message (e.g., fast fax), post directly
             warn!("Fax ended without a receiving message — posting directly");
@@ -677,6 +680,7 @@ impl FaxSession {
                 }
                 Err(e) => {
                     error!("Failed to post fax: {}", e);
+                    self.retain_failed_upload(&e.to_string());
                     self.state = FaxState::Failed(format!("Discord error: {}", e));
                     return Err(e);
                 }
@@ -690,7 +694,7 @@ impl FaxSession {
         };
         let post_result = if is_incomplete {
             self.poster
-                .edit_fax_incomplete(discord_msg_id, image_pages, file_ext)
+                .edit_fax_incomplete(discord_msg_id, image_pages, page_count, file_ext)
                 .await
         } else {
             let image_data = image_pages.into_iter().map(|page| page.data).collect();
@@ -721,12 +725,43 @@ impl FaxSession {
             }
             Err(e) => {
                 error!("Failed to post fax result: {}", e);
-                self.state = FaxState::Failed(format!("Discord upload error: {}", e));
-                return Err(e);
+                self.retain_failed_upload(&e.to_string());
+                // Delivery has already exhausted its retries. Report that cause
+                // here so callers do not replace it with a conversion/timeout error.
+                self.post_failure(
+                    "Could not upload fax after 3 attempts. Received fax retained for recovery.",
+                )
+                .await;
+                return Ok(());
             }
         }
 
         Ok(())
+    }
+
+    fn retain_failed_upload(&mut self, reason: &str) {
+        // Keep the original if archiving fails (including a full data volume).
+        self.retain_temp_files = true;
+        let archive_root = PathBuf::from(crate::config::EnvConfig::global().resolved_data_dir())
+            .join("failed-faxes");
+        let metadata = serde_json::json!({
+            "call_id": *self.call_id,
+            "channel_id": self.text_channel_id.to_string(),
+            "guild_id": self.guild_id.to_string(),
+            "user_id": self.user_id,
+            "message_id": self.receiving_message_id,
+            "failed_at": chrono::Utc::now().to_rfc3339(),
+            "reason": reason,
+        });
+        match archive_failed_fax(&self.tiff_dir, &archive_root, &metadata) {
+            Ok(path) => {
+                self.retain_temp_files = false;
+                warn!(call_id = %self.call_id, path = %path.display(), "Retained fax after failed upload");
+            }
+            Err(error) => {
+                error!(call_id = %self.call_id, %error, path = %self.tiff_dir.display(), "Failed to archive fax; retaining original temp files");
+            }
+        }
     }
 
     /// Switch from G.711 audio mode to T.38 UDPTL mode.
@@ -787,6 +822,10 @@ impl Drop for FaxSession {
             self.created_at.elapsed().as_secs_f64(),
             self.audio_duration_secs()
         );
+        if self.retain_temp_files {
+            warn!(call_id = %self.call_id, path = %self.tiff_dir.display(), "Keeping failed fax temp files");
+            return;
+        }
         if let Err(e) = std::fs::remove_dir_all(&self.tiff_dir) {
             debug!(
                 "Failed to clean up fax temp dir {}: {}",
@@ -797,6 +836,32 @@ impl Drop for FaxSession {
             debug!("Cleaned up fax temp dir: {}", self.tiff_dir.display());
         }
     }
+}
+
+/// Copy before removing anything: the temp directory and data directory may
+/// be on different filesystems. Failure leaves the source available for recovery.
+fn archive_failed_fax(
+    source: &std::path::Path,
+    archive_root: &std::path::Path,
+    metadata: &serde_json::Value,
+) -> std::io::Result<PathBuf> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("fax directory has no name"))?;
+    std::fs::create_dir_all(archive_root)?;
+    let destination = archive_root.join(name);
+    std::fs::create_dir(&destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+        }
+    }
+    std::fs::write(
+        destination.join("delivery.json"),
+        serde_json::to_vec_pretty(metadata)?,
+    )?;
+    Ok(destination)
 }
 
 // Pure state transition logic (extracted for testability)
@@ -859,6 +924,56 @@ impl OutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_upload_archive_preserves_tiff_and_delivery_context() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("fax-archive-test-{}-{stamp}", std::process::id()));
+        let source = root.join("session");
+        let archive = root.join("failed-faxes");
+        std::fs::create_dir_all(&source).unwrap();
+        let tiff = b"original fax bytes";
+        std::fs::write(source.join("fax.tiff"), tiff).unwrap();
+        let metadata = serde_json::json!({"message_id": 123, "reason": "upload rejected"});
+        let saved = archive_failed_fax(&source, &archive, &metadata).unwrap();
+        assert_eq!(std::fs::read(saved.join("fax.tiff")).unwrap(), tiff);
+        let saved_metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(saved.join("delivery.json")).unwrap()).unwrap();
+        assert_eq!(saved_metadata, metadata);
+        // A failed repeat cannot overwrite the archive or consume the source.
+        assert!(archive_failed_fax(&source, &archive, &metadata).is_err());
+        assert_eq!(std::fs::read(source.join("fax.tiff")).unwrap(), tiff);
+        // An unavailable archive root likewise leaves the received TIFF intact.
+        assert!(archive_failed_fax(&source, &source.join("fax.tiff"), &metadata).is_err());
+        assert_eq!(std::fs::read(source.join("fax.tiff")).unwrap(), tiff);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progressing_long_fax_can_continue_until_one_hour() {
+        let start = Instant::now();
+        for minutes in [30, 45, 59] {
+            let now = start + Duration::from_secs(minutes * 60);
+            assert_eq!(
+                timeout_reason_at(start, now - Duration::from_secs(20), now),
+                None
+            );
+        }
+        let limit = start + Duration::from_secs(60 * 60);
+        assert_eq!(
+            timeout_reason_at(start, limit, limit),
+            Some(FaxTimeoutReason::SessionLimit)
+        );
+        let stalled = start + Duration::from_secs(45 * 60);
+        assert_eq!(
+            timeout_reason_at(start, stalled - Duration::from_secs(300), stalled),
+            Some(FaxTimeoutReason::Inactive)
+        );
+    }
 
     // Helper: check if a FaxState is_finished (mirrors FaxSession::is_finished logic)
     fn state_is_finished(state: &FaxState) -> bool {

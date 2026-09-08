@@ -52,7 +52,7 @@ impl fmt::Display for InvState {
 }
 use crate::transport::sip::callbacks::{
     on_call_media_state_cb, on_call_rx_reinvite_cb, on_call_state_cb, on_dtmf_digit_cb,
-    on_incoming_call_cb,
+    on_incoming_call_cb, on_stream_precreate_cb,
 };
 use crate::transport::sip::nat::{
     on_rx_request_nat_fixup_cb, on_rx_response_nat_fixup_cb, on_tx_request_cb, on_tx_response_cb,
@@ -386,6 +386,7 @@ pub fn init_pjsua(
 
         // Set callbacks
         cfg_ptr.cb.on_incoming_call = Some(on_incoming_call_cb);
+        cfg_ptr.cb.on_stream_precreate = Some(on_stream_precreate_cb);
         cfg_ptr.cb.on_call_state = Some(on_call_state_cb);
         cfg_ptr.cb.on_call_media_state = Some(on_call_media_state_cb);
         cfg_ptr.cb.on_dtmf_digit = Some(on_dtmf_digit_cb);

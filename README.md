@@ -165,6 +165,10 @@ SIP_LOCAL_CIDR=192.168.1.0/24
 
 The bridge can receive faxes (both G.711 passthrough and T.38 UDPTL). Received faxes are demodulated via SpanDSP and posted as PNG images to a Discord text channel. To set up fax, add a mapping with a text channel ID in your dialplan — the bridge routes faxes to text channels and voice calls to voice channels automatically.
 
+Fax reception can continue for up to 60 minutes while making progress, with a five-minute inactivity timeout. G.711 fax calls use a 200 ms jitter prefetch and a one-second buffer, with progressive audio discard, silence suppression, and speech packet-loss concealment disabled.
+
+Discord posts show at most the first 10 usable pages and include a truncation notice when more were received. Failed uploads retry twice (after two and five seconds) by editing the same message. If delivery still fails, the original TIFF and `delivery.json` context are retained under `${DATA_DIR}/failed-faxes/<session>/` for manual recovery. If that archive cannot be written, the original fax temp directory is kept and its path is logged. Retained files are not automatically deleted or retried after a restart.
+
 ### Acknowledgements
 
 - Thanks to [dusthillguy](https://dusthillguy-music-blog1.tumblr.com/) for letting me use the song [*"Joona Kouvolalainen buttermilk"*](https://www.youtube.com/watch?v=IK1ydvw3xkU) as hold music.
