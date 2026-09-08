@@ -919,8 +919,8 @@ fn decode_mode(reader: &mut BitReader) -> Option<Mode> {
 // Reference Line Helpers (for 2D decoding)
 
 /// Find b1: the next transition on the reference line of the opposite color,
-/// at or after position `a0`.
-fn find_b1(reference: &[u16], a0: u16, current_color: Color, width: u16) -> u16 {
+/// to the right of `a0`, including x=0 at the start of a line.
+fn find_b1(reference: &[u16], a0: u16, current_color: Color, width: u16, at_start: bool) -> u16 {
     // Reference transitions alternate white->black (index 0), black->white (index 1), ...
     // We need the first transition in reference that is > a0 and corresponds to the opposite color.
     // Color at position 0 is White. Transition at index i flips to:
@@ -936,7 +936,11 @@ fn find_b1(reference: &[u16], a0: u16, current_color: Color, width: u16) -> u16 
     // If want_white_transition, we want an odd-indexed transition (black->white)
 
     for (i, &t) in reference.iter().enumerate() {
-        if t <= a0 {
+        // T.4 starts a0 on an imaginary white pixel before the first pixel.
+        // A black reference line therefore has a valid transition at x=0.
+        // After the first mode, a0 is a real changing element and equality
+        // must be excluded, even if a vertical mode left it at x=0.
+        if !at_start && t <= a0 {
             continue;
         }
         let is_even = i % 2 == 0;
@@ -981,6 +985,7 @@ fn decode_line_2d(reader: &mut BitReader, reference: &[u16], width: u16) -> Opti
     let mut transitions = Vec::new();
     let mut a0 = 0u16;
     let mut color = Color::White;
+    let mut at_start = true;
 
     loop {
         if a0 >= width {
@@ -990,13 +995,13 @@ fn decode_line_2d(reader: &mut BitReader, reference: &[u16], width: u16) -> Opti
         let mode = decode_mode(reader)?;
         match mode {
             Mode::Pass => {
-                let b1 = find_b1(reference, a0, color, width);
+                let b1 = find_b1(reference, a0, color, width, at_start);
                 let b2 = find_b2(reference, b1, width);
                 a0 = b2;
                 // Color doesn't change after pass
             }
             Mode::Vertical(delta) => {
-                let b1 = find_b1(reference, a0, color, width);
+                let b1 = find_b1(reference, a0, color, width, at_start);
                 let a1 = (b1 as i32 + delta as i32).max(0) as u16;
                 if a1 >= width {
                     // Line ends
@@ -1020,6 +1025,7 @@ fn decode_line_2d(reader: &mut BitReader, reference: &[u16], width: u16) -> Opti
                 // Color returns to original after horizontal
             }
         }
+        at_start = false;
     }
 
     Some(transitions)
@@ -1248,6 +1254,72 @@ fn assemble_image(lines: &[Vec<u16>], width: u32, height: u32, photometric: u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packed_bits(bits: &str) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8) + 2];
+        for (i, bit) in bits.bytes().enumerate() {
+            assert!(matches!(bit, b'0' | b'1'));
+            bytes[i / 8] |= (bit - b'0') << (7 - i % 8);
+        }
+        bytes
+    }
+
+    #[test]
+    fn decode_2d_vertical_preserves_black_left_edge() {
+        // Five V(0) codes reproduce the reference's four changes and end.
+        let data = packed_bits("11111");
+        let mut reader = BitReader::new(&data);
+        assert_eq!(
+            decode_line_2d(&mut reader, &[0, 4, 8, 12], 16),
+            Some(vec![0, 4, 8, 12])
+        );
+    }
+
+    #[test]
+    fn decode_2d_pass_skips_first_black_run_at_left_edge() {
+        // Pass the reference's black pixels 0..4, then copy changes 8 and 12.
+        let data = packed_bits("0001111");
+        let mut reader = BitReader::new(&data);
+        assert_eq!(
+            decode_line_2d(&mut reader, &[0, 4, 8, 12], 16),
+            Some(vec![8, 12])
+        );
+    }
+
+    #[test]
+    fn decode_2d_vertical_left_reaches_zero_then_advances() {
+        // V(-2), V(0), V(0): a white reference margin can become black at x=0.
+        let data = packed_bits("00001011");
+        let mut reader = BitReader::new(&data);
+        assert_eq!(decode_line_2d(&mut reader, &[2, 6], 16), Some(vec![0, 6]));
+    }
+
+    #[test]
+    fn group3_and_group4_decode_repeated_black_left_edges() {
+        // Each row is four black, four white, four black, four white pixels.
+        // Group 3 starts with MH runs W0/B4/W4/B4/W4, then uses V(0).
+        let eol = "000000000001";
+        let mut group3 = format!("{eol}10011010101110110111011");
+        for _ in 1..80 {
+            group3.push_str(&format!("{eol}011111"));
+        }
+        group3.push_str(eol);
+
+        // Group 4 starts against white: H(W0,B4), H(W4,B4), V(0).
+        let mut group4 = String::from("0010011010101100110110111");
+        group4.push_str(&"11111".repeat(79));
+        group4.push_str(&format!("{eol}{eol}"));
+
+        let expected = vec![vec![0, 4, 8, 12]; 80];
+        assert_eq!(
+            decode_group3(&packed_bits(&group3), 16, 80, 1).unwrap(),
+            expected
+        );
+        assert_eq!(
+            decode_group4(&packed_bits(&group4), 16, 80).unwrap(),
+            expected
+        );
+    }
 
     /// Test against the example fax TIFF bundled in src/fax/.
     /// This is a real SpanDSP-produced TIFF: compression=3, FillOrder=2, T4Options=5 (2D + fill bits).

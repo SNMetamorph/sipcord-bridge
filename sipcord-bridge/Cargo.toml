@@ -70,10 +70,10 @@ claxon = "0.4.3"
 pjsua = { path = "../pjsua" }
 
 # SpanDSP - fax demodulation
-spandsp = "0.1.5"
+spandsp = "0.2.0"
 
 # UDPTL transport for T.38 fax
-udptl = "0.1.0"
+udptl = "0.2.0"
 
 # Image conversion (fax TIFF -> PNG for Discord)
 image = { version = "0.25", default-features = false, features = [

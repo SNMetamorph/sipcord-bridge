@@ -13,6 +13,7 @@ use crate::fax::spandsp::{FaxReceiver, FaxRxStatus, FaxT38Receiver};
 use crate::fax::tiff_decoder::{self, DecodedFax, FaxPageCompleteness};
 use crate::services::snowflake::Snowflake;
 use crate::transport::sip::CallId;
+use spandsp::{ReceiveCompletion, ReceivePageKind, ReceiveReport};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -67,6 +68,33 @@ fn timeout_reason_at(
 
 fn result_is_incomplete(protocol_reason: Option<&str>, decoded: &DecodedFax) -> bool {
     protocol_reason.is_some() || decoded.is_incomplete()
+}
+
+/// Recovered TIFFs declare only the rows actually saved. Their dimensions alone
+/// cannot distinguish a recovered prefix from a complete page.
+fn receive_report_incomplete_reason(
+    report: &ReceiveReport,
+    document_end_signaled: bool,
+) -> Option<String> {
+    if !report.output_closed || report.output_error.is_some() {
+        return Some("Fax output could not be saved completely".to_string());
+    }
+    if report.missing_tail
+        || report.unsupported_partial_codec
+        || report
+            .pages
+            .iter()
+            .any(|page| page.kind == ReceivePageKind::RecoveredPartial || page.missing_tail)
+    {
+        return Some("Fax ended with an incomplete page".to_string());
+    }
+    match report.completion {
+        ReceiveCompletion::Completed { code: 0 } => None,
+        ReceiveCompletion::Completed { code } => Some(format!("Fax failed with T.30 code {code}")),
+        ReceiveCompletion::Interrupted { .. } => {
+            call_end_incomplete_reason(report.confirmed_complete_pages, document_end_signaled)
+        }
+    }
 }
 
 pub(crate) fn call_end_incomplete_reason(
@@ -136,6 +164,8 @@ pub struct FaxSession {
     /// A protocol, timeout, or disconnect reason which makes an otherwise
     /// readable TIFF an incomplete result.
     pending_incomplete_reason: Option<String>,
+    /// Inventory of closed native TIFF output, captured once before conversion.
+    receive_report: Option<ReceiveReport>,
     /// Discord poster for this session
     pub poster: DiscordPoster,
     /// SpanDSP fax receiver (audio or T.38 mode)
@@ -198,6 +228,7 @@ impl FaxSession {
             last_progress_at: now,
             last_progress: FaxProgress::default(),
             pending_incomplete_reason: None,
+            receive_report: None,
             poster,
             receiver: FaxReceiverKind::Audio(receiver),
             tiff_dir,
@@ -414,20 +445,47 @@ impl FaxSession {
             return;
         }
 
-        let terminate_result = match &mut self.receiver {
-            FaxReceiverKind::Audio(receiver) => receiver.terminate_reception(),
-            FaxReceiverKind::T38(receiver) => receiver.terminate_reception(),
-        };
-        if let Err(error) = terminate_result {
-            warn!(
-                call_id = %self.call_id,
-                error = ?error,
-                "Failed to terminate SpanDSP reception cleanly before recovery"
-            );
+        if self.pending_incomplete_reason.is_none() {
+            self.pending_incomplete_reason = incomplete_reason;
         }
-
-        self.pending_incomplete_reason = incomplete_reason;
+        self.finalize_receive();
         self.state = FaxState::Received;
+    }
+
+    fn finalize_receive(&mut self) {
+        if self.receive_report.is_some() {
+            return;
+        }
+        let report = match &mut self.receiver {
+            FaxReceiverKind::Audio(receiver) => receiver.finalize_receive().clone(),
+            FaxReceiverKind::T38(receiver) => receiver.finalize_receive().clone(),
+        };
+        if self.pending_incomplete_reason.is_none() {
+            self.pending_incomplete_reason =
+                receive_report_incomplete_reason(&report, self.document_end_signaled());
+        }
+        debug!(
+            call_id = %self.call_id,
+            completion = ?report.completion,
+            confirmed_pages = report.confirmed_complete_pages,
+            saved_pages = report.pages.len(),
+            output_closed = report.output_closed,
+            output_error = ?report.output_error,
+            missing_tail = report.missing_tail,
+            unsupported_partial_codec = report.unsupported_partial_codec,
+            "Finalized SpanDSP fax output"
+        );
+        for (index, page) in report.pages.iter().enumerate() {
+            if page.kind == ReceivePageKind::RecoveredPartial {
+                warn!(
+                    call_id = %self.call_id,
+                    page = index + 1,
+                    decoded_rows = page.decoded_rows,
+                    "SpanDSP preserved an unfinished fax page"
+                );
+            }
+        }
+        self.receive_report = Some(report);
     }
 
     /// Post the initial "Receiving fax..." message to Discord.
@@ -479,6 +537,19 @@ impl FaxSession {
                 "convert_and_post called on already-finished session {} — skipping",
                 self.call_id
             );
+            return Ok(());
+        }
+
+        // Also finalize normal phase-E completion: preservation and file closure
+        // must happen before the TIFF decoder opens the output on every path.
+        self.finalize_receive();
+        if self
+            .receive_report
+            .as_ref()
+            .is_some_and(|report| !report.output_closed)
+        {
+            self.post_failure("Could not close received fax output")
+                .await;
             return Ok(());
         }
 
@@ -537,7 +608,15 @@ impl FaxSession {
         let partial_page_count = decoded
             .pages
             .iter()
-            .filter(|page| matches!(page.completeness, FaxPageCompleteness::Partial { .. }))
+            .filter(|page| {
+                matches!(page.completeness, FaxPageCompleteness::Partial { .. })
+                    || self.receive_report.as_ref().is_some_and(|report| {
+                        report
+                            .pages
+                            .get(page.page_number as usize - 1)
+                            .is_some_and(|native| native.kind == ReceivePageKind::RecoveredPartial)
+                    })
+            })
             .count();
         let omitted_page_count = decoded.omitted_pages.len();
         let is_incomplete =
@@ -856,6 +935,62 @@ mod tests {
         assert_eq!(call_end_incomplete_reason(1, true), None);
         assert!(call_end_incomplete_reason(1, false).is_some());
         assert!(call_end_incomplete_reason(0, true).is_some());
+    }
+
+    fn complete_receive_report() -> ReceiveReport {
+        ReceiveReport {
+            completion: ReceiveCompletion::Completed { code: 0 },
+            confirmed_complete_pages: 1,
+            pages: vec![spandsp::ReceivePage {
+                kind: ReceivePageKind::Complete,
+                decoded_rows: 500,
+                pixel_width: 1728,
+                horizontal_resolution: 8031,
+                vertical_resolution: 7700,
+                decoder_bad_rows: 0,
+                missing_tail: false,
+            }],
+            output_closed: true,
+            output_error: None,
+            missing_tail: false,
+            unsupported_partial_codec: false,
+            // All fields are native integer statistics.
+            statistics: unsafe { std::mem::zeroed() },
+        }
+    }
+
+    #[test]
+    fn native_recovery_is_incomplete_even_when_saved_tiff_has_all_declared_rows() {
+        let mut report = complete_receive_report();
+        assert!(receive_report_incomplete_reason(&report, true).is_none());
+        report.pages[0].kind = ReceivePageKind::RecoveredPartial;
+        assert!(receive_report_incomplete_reason(&report, true).is_some());
+    }
+
+    #[test]
+    fn native_finalization_preserves_protocol_failure_and_clean_eop_disconnect() {
+        let mut report = complete_receive_report();
+        report.completion = ReceiveCompletion::Completed { code: 42 };
+        assert!(receive_report_incomplete_reason(&report, true).is_some());
+        report.completion = ReceiveCompletion::Interrupted { last_status: 0 };
+        assert!(receive_report_incomplete_reason(&report, true).is_none());
+        assert!(receive_report_incomplete_reason(&report, false).is_some());
+        report.confirmed_complete_pages = 0;
+        assert!(receive_report_incomplete_reason(&report, true).is_some());
+    }
+
+    #[test]
+    fn native_missing_output_is_incomplete_even_after_successful_phase_e() {
+        for flag in 0..4 {
+            let mut report = complete_receive_report();
+            match flag {
+                0 => report.missing_tail = true,
+                1 => report.unsupported_partial_codec = true,
+                2 => report.output_closed = false,
+                _ => report.output_error = Some(spandsp::ReceiveOutputError::WRITE),
+            }
+            assert!(receive_report_incomplete_reason(&report, true).is_some());
+        }
     }
 
     // Timeout policy tests

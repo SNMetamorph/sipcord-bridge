@@ -3747,7 +3747,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sipcord-bridge"
-version = "2.1.12"
+version = "2.1.13"
 dependencies = [
  "async-trait",
  "audioadapter",
@@ -3886,9 +3886,9 @@ dependencies = [
 
 [[package]]
 name = "spandsp"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5f076b6e56f1a1062d6950dcd1c6c1df281ae2828db271929c50c191ec8c79e"
+checksum = "dff2ad1c0d8ff44bf40d03ad314c0dc6895f843868ec6cc3719189055902b628"
 dependencies = [
  "bitflags 2.11.0",
  "spandsp-sys",
@@ -3897,9 +3897,9 @@ dependencies = [
 
 [[package]]
 name = "spandsp-sys"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c05ab99051230293dded61ba3cd32f06eb15b437a8135be21f560f72bab713db"
+checksum = "bcc14bd05d640cd3e7347ed5ba83dbcf50dd9ed82a626a87fe38c15ca25d6724"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -4700,9 +4700,9 @@ dependencies = [
 
 [[package]]
 name = "udptl"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b255ad0ff36582a8a453c42a2bcc16c72d00f0ab16a14a4a7aeacb55ccb2a351"
+checksum = "6691f39166a83afc930d927f70716b3fb8d98fb48084a7291304853d2352c6ea"
 dependencies = [
  "thiserror 2.0.18",
  "tokio",

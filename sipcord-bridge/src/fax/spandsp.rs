@@ -9,6 +9,7 @@ use spandsp::logging::{LogLevel, LogShowFlags};
 use spandsp::spandsp_sys;
 use spandsp::t30::T30ModemSupport;
 use spandsp::t38_terminal::T38Terminal;
+use spandsp::{ReceiveRecovery, ReceiveReport};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -264,9 +265,11 @@ impl FaxReceiver {
             .to_str()
             .ok_or_else(|| FaxError::NonUtf8Path(tiff_path.display().to_string()))?;
 
-        let fax = FaxState::new(false).map_err(|e| FaxError::SpanDsp {
-            operation: "FaxState::new",
-            detail: e.to_string(),
+        let fax = FaxState::new_receiver(ReceiveRecovery::PreserveDecodedRows).map_err(|e| {
+            FaxError::SpanDsp {
+                operation: "FaxState::new_receiver",
+                detail: e.to_string(),
+            }
         })?;
 
         let t30 = fax.get_t30_state().map_err(|e| FaxError::SpanDsp {
@@ -291,6 +294,7 @@ impl FaxReceiver {
             configure_log_state(spandsp_sys::fax_get_logging_state(fax.as_ptr()));
             configure_log_state(spandsp_sys::t30_get_logging_state(t30.as_ptr()));
         }
+        drop(t30);
 
         debug!(
             "SpanDSP fax receiver initialized, output: {}",
@@ -349,17 +353,10 @@ impl FaxReceiver {
         self.callback_state.document_end_signaled
     }
 
-    /// Tell SpanDSP that the call has ended, closing any completed TIFF pages
-    /// before the file is read by the recovery path.
-    pub(crate) fn terminate_reception(&mut self) -> Result<(), FaxError> {
-        let t30 = self.fax.get_t30_state().map_err(|e| FaxError::SpanDsp {
-            operation: "FaxState::get_t30_state",
-            detail: e.to_string(),
-        })?;
-        // SAFETY: `t30` belongs to `self.fax`, which remains alive, and this
-        // method has exclusive access to the receiver and callback state.
-        unsafe { spandsp_sys::t30_terminate(t30.as_ptr()) };
-        Ok(())
+    /// Preserve decoded rows and close TIFF output before conversion. The native
+    /// report is cached, so repeated finalization never appends duplicate pages.
+    pub(crate) fn finalize_receive(&mut self) -> &ReceiveReport {
+        self.fax.finalize_receive()
     }
 
     /// Whether SpanDSP has entered T.30 phase B negotiation.
@@ -443,11 +440,14 @@ impl FaxT38Receiver {
         let tx_user_data = &*tx_callback_state as *const TxCallbackState as *mut std::ffi::c_void;
 
         let terminal = unsafe {
-            T38Terminal::new_raw(false, Some(tx_packet_handler), tx_user_data).map_err(|e| {
-                FaxError::SpanDsp {
-                    operation: "T38Terminal::new_raw",
-                    detail: e.to_string(),
-                }
+            T38Terminal::new_receiver_raw(
+                ReceiveRecovery::PreserveDecodedRows,
+                Some(tx_packet_handler),
+                tx_user_data,
+            )
+            .map_err(|e| FaxError::SpanDsp {
+                operation: "T38Terminal::new_receiver_raw",
+                detail: e.to_string(),
             })?
         };
 
@@ -480,6 +480,7 @@ impl FaxT38Receiver {
                 })?;
             configure_log_state(spandsp_sys::t38_core_get_logging_state(t38_core.as_ptr()));
         }
+        drop(t30);
 
         debug!(
             "T.38 fax receiver initialized, output: {}",
@@ -535,20 +536,10 @@ impl FaxT38Receiver {
         self.callback_state.document_end_signaled
     }
 
-    /// Tell SpanDSP that the call has ended, closing any completed TIFF pages
-    /// before the file is read by the recovery path.
-    pub(crate) fn terminate_reception(&mut self) -> Result<(), FaxError> {
-        let t30 = self
-            .terminal
-            .get_t30_state()
-            .map_err(|e| FaxError::SpanDsp {
-                operation: "T38Terminal::get_t30_state",
-                detail: e.to_string(),
-            })?;
-        // SAFETY: `t30` belongs to `self.terminal`, which remains alive, and
-        // this method has exclusive access to the receiver and callback state.
-        unsafe { spandsp_sys::t30_terminate(t30.as_ptr()) };
-        Ok(())
+    /// Preserve decoded rows and close TIFF output before conversion. The native
+    /// report is cached, so repeated finalization never appends duplicate pages.
+    pub(crate) fn finalize_receive(&mut self) -> &ReceiveReport {
+        self.terminal.finalize_receive()
     }
 
     /// Whether SpanDSP has entered T.30 phase B negotiation.
@@ -714,6 +705,154 @@ mod tests {
                 | T4_RESOLUTION_200_200
                 | T4_RESOLUTION_200_400
         );
+    }
+
+    struct RecoveryFiles(PathBuf);
+
+    impl RecoveryFiles {
+        fn new() -> Self {
+            static ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "sipcord-native-recovery-{}-{}.tiff",
+                std::process::id(),
+                ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            Self(path)
+        }
+    }
+
+    impl Drop for RecoveryFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn configure_test_sender(t30: spandsp::t30::T30State<'_>) {
+        let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fax/example.tiff");
+        t30.set_tx_file(input.to_str().unwrap(), -1, -1).unwrap();
+        t30.set_ecm_capability(false).unwrap();
+        t30.set_supported_compressions(T4_COMPRESSION_T4_1D)
+            .unwrap();
+        t30.set_supported_modems(T30ModemSupport::V17).unwrap();
+    }
+
+    fn assert_recovered_output(path: &Path, report: &ReceiveReport, complete: bool) {
+        assert!(report.output_closed);
+        assert!(report.output_error.is_none());
+        assert_eq!(report.pages.len(), 1);
+        let page = &report.pages[0];
+        if complete {
+            assert_eq!(
+                report.completion,
+                spandsp::ReceiveCompletion::Completed { code: 0 }
+            );
+            assert_eq!(report.confirmed_complete_pages, 1);
+            assert_eq!(page.kind, spandsp::ReceivePageKind::Complete);
+        } else {
+            assert!(matches!(
+                report.completion,
+                spandsp::ReceiveCompletion::Interrupted { .. }
+            ));
+            assert_eq!(report.confirmed_complete_pages, 0);
+            assert_eq!(page.kind, spandsp::ReceivePageKind::RecoveredPartial);
+            assert!(page.missing_tail);
+            assert!(page.decoded_rows >= 500 && page.decoded_rows < 2199);
+        }
+        let decoded = crate::fax::tiff_decoder::decode_fax_tiff_with_report(path).unwrap();
+        assert_eq!(decoded.pages.len(), 1);
+        assert_eq!(decoded.pages[0].image.width(), page.pixel_width);
+        // Native preservation sets TIFF height to the saved prefix. The session
+        // must consult ReceiveReport to label it incomplete.
+        assert!(!decoded.is_incomplete());
+    }
+
+    #[test]
+    fn audio_finalization_preserves_interrupted_rows_and_normal_completion() {
+        for complete in [false, true] {
+            let files = RecoveryFiles::new();
+            let tx = FaxState::new(true).unwrap();
+            configure_test_sender(tx.get_t30_state().unwrap());
+            tx.set_transmit_on_idle(true);
+            let mut rx = FaxReceiver::new_audio_receiver(&files.0).unwrap();
+            let mut reached_stop = false;
+            for _ in 0..30000 {
+                let mut incoming = [0i16; 160];
+                let mut outgoing = [0i16; 320];
+                tx.tx(&mut incoming);
+                rx.generate_tx_16k(&mut outgoing);
+                let mut return_audio = downsample_16k_to_8k(&mut Vec::new(), &outgoing);
+                tx.rx(&mut return_audio);
+                let mut input_16k = [0i16; 320];
+                upsample_8k_to_16k(&incoming, &mut input_16k);
+                let status = rx.feed_samples_16k(&input_16k);
+                if (complete && status == FaxRxStatus::Complete)
+                    || (!complete && rx.get_stats().unwrap().image_length >= 500)
+                {
+                    reached_stop = true;
+                    break;
+                }
+                assert!(!matches!(status, FaxRxStatus::Error(_)), "{status:?}");
+            }
+            assert!(reached_stop);
+            let report = rx.finalize_receive().clone();
+            assert_recovered_output(&files.0, &report, complete);
+            let bytes = std::fs::read(&files.0).unwrap();
+            assert_eq!(rx.finalize_receive().pages, report.pages);
+            assert_eq!(std::fs::read(&files.0).unwrap(), bytes);
+            assert_eq!(rx.generate_tx_16k(&mut [0; 320]), 0);
+        }
+    }
+
+    #[test]
+    fn t38_finalization_preserves_interrupted_rows_and_normal_completion() {
+        for complete in [false, true] {
+            let files = RecoveryFiles::new();
+            let (tx_send, mut tx_recv) = mpsc::unbounded_channel();
+            let (rx_send, mut rx_recv) = mpsc::unbounded_channel();
+            // The sender callback storage outlives its terminal.
+            let tx_callbacks = Box::new(TxCallbackState { sender: tx_send });
+            let tx = unsafe {
+                T38Terminal::new_raw(
+                    true,
+                    Some(tx_packet_handler),
+                    (&*tx_callbacks as *const TxCallbackState).cast_mut().cast(),
+                )
+                .unwrap()
+            };
+            configure_test_sender(tx.get_t30_state().unwrap());
+            let mut rx = FaxT38Receiver::new(&files.0, rx_send).unwrap();
+            let (mut tx_seq, mut rx_seq) = (0u16, 0u16);
+            let mut reached_stop = false;
+            for _ in 0..30000 {
+                tx.send_timeout(160);
+                rx.drive_timer();
+                while let Ok(data) = tx_recv.try_recv() {
+                    rx.feed_ifp_packet(&data, tx_seq);
+                    tx_seq = tx_seq.wrapping_add(1);
+                }
+                while let Ok(data) = rx_recv.try_recv() {
+                    tx.get_t38_core_state()
+                        .unwrap()
+                        .rx_ifp_packet(&data, rx_seq)
+                        .unwrap();
+                    rx_seq = rx_seq.wrapping_add(1);
+                }
+                let status = rx.current_status();
+                if (complete && status == FaxRxStatus::Complete)
+                    || (!complete && rx.get_stats().unwrap().image_length >= 500)
+                {
+                    reached_stop = true;
+                    break;
+                }
+                assert!(!matches!(status, FaxRxStatus::Error(_)), "{status:?}");
+            }
+            assert!(reached_stop);
+            let report = rx.finalize_receive().clone();
+            assert_recovered_output(&files.0, &report, complete);
+            let bytes = std::fs::read(&files.0).unwrap();
+            assert_eq!(rx.finalize_receive().pages, report.pages);
+            assert_eq!(std::fs::read(&files.0).unwrap(), bytes);
+        }
     }
 
     // check_completion tests
